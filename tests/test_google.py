@@ -70,6 +70,7 @@ def db(monkeypatch):
     events, runs = [], []
     monkeypatch.setattr(google, "upsert", lambda conn, t, rows, k: runs.append(rows[0]))
     monkeypatch.setattr(google, "upsert_rows", lambda conn, rows: (events.append("hotels"), setattr(google, "LAST_ROWS", rows)))
+    monkeypatch.setattr(google, "check_spend", lambda conn, cfg: events.append("spend"))
     monkeypatch.setattr(google.time, "sleep", lambda s: None)
     return events, runs
 
@@ -154,6 +155,7 @@ def test_rescued_only_at_stage3_and_zero_item_stage2_is_not_abort(db):
         [{"search_query": "Amankila Bali", "name": "Zzz Qqq"}], [],
         [{"search_query": "hotels in Amankila Bali", "name": "Amankila", "star_rating": 5}]])
     assert len(c.inputs) == 3 and google.LAST_ROWS[0]["google_query"] == "hotels in Amankila Bali"
+    assert events.count("spend") == 3  # guard before every Apify run
 
 
 def test_never_found_stamped_with_last_query_and_best_kept(db):

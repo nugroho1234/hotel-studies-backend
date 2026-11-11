@@ -100,6 +100,7 @@ def process_chunk(client, conn, hotels: list[tuple[int, str, str]], cfg: dict) -
                    if (best[h] is None or is_miss(best[h][0], cfg)) and form_query(form, n, d, g) != last_q.get(h)]
         if not pending:
             continue
+        check_spend(conn, cfg)
         items, dataset_id = _search(client, [q for _, _, q in pending], cfg, conn, form, allow_empty=stage > 0)
         datasets.append(dataset_id)
         by_query = group_results(items)
@@ -143,7 +144,6 @@ def run_google_stars(limit: int | None = None, destination: str | None = None) -
     with connect() as conn:
         hotels = conn.execute(sql, args).fetchall()
         for i in range(0, len(hotels), n):
-            check_spend(conn, cfg)
             done += process_chunk(client, conn, hotels[i:i + n], cfg)
             runs += 1
     return {"hotels": done, "runs": runs}
