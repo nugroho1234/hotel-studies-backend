@@ -41,7 +41,11 @@ class FakeClient:
     def run(self, _):
         return self
 
+    statuses = None
+
     def wait_for_finish(self):
+        if self.statuses:
+            self.status = self.statuses.pop(0)
         return R(self.status, 0.0)
 
     def get(self):
@@ -65,11 +69,15 @@ class Conn:
         self.events.append("commit")
 
 
+ROWS = []  # rows passed to upsert_rows, cleared per test
+
+
 @pytest.fixture
 def db(monkeypatch):
+    ROWS.clear()
     events, runs = [], []
     monkeypatch.setattr(google, "upsert", lambda conn, t, rows, k: runs.append(rows[0]))
-    monkeypatch.setattr(google, "upsert_rows", lambda conn, rows: (events.append("hotels"), setattr(google, "LAST_ROWS", rows)))
+    monkeypatch.setattr(google, "upsert_rows", lambda conn, rows: (events.append("hotels"), ROWS.extend(rows)))
     monkeypatch.setattr(google, "check_spend", lambda conn, cfg: events.append("spend"))
     monkeypatch.setattr(google.time, "sleep", lambda s: None)
     return events, runs
@@ -146,7 +154,7 @@ def test_rescued_at_stage2(db):
         [{"search_query": "Amankila", "name": "Amankila", "star_rating": 5}]])
     assert len(c.inputs) == 2 and c.inputs[1]["queries"] == ["Amankila"]
     assert [r["input"]["query_form"] for r in runs if "input" in r] == ["plain", "name_only"]
-    assert google.LAST_ROWS[0]["google_query"] == "Amankila" and google.LAST_ROWS[0]["google_star_rating"] == 5
+    assert ROWS[-1]["google_query"] == "Amankila" and ROWS[-1]["google_star_rating"] == 5
 
 
 def test_rescued_only_at_stage3_and_zero_item_stage2_is_not_abort(db):
@@ -154,14 +162,14 @@ def test_rescued_only_at_stage3_and_zero_item_stage2_is_not_abort(db):
     c, _ = run(None, [0.009], events=events, per_run=[
         [{"search_query": "Amankila Bali", "name": "Zzz Qqq"}], [],
         [{"search_query": "hotels in Amankila Bali", "name": "Amankila", "star_rating": 5}]])
-    assert len(c.inputs) == 3 and google.LAST_ROWS[0]["google_query"] == "hotels in Amankila Bali"
+    assert len(c.inputs) == 3 and ROWS[-1]["google_query"] == "hotels in Amankila Bali"
     assert events.count("spend") == 3  # guard before every Apify run
 
 
 def test_never_found_stamped_with_last_query_and_best_kept(db):
     events, _ = db
     c, _ = run(None, [0.009], events=events, per_run=[[{"search_query": "Amankila Bali", "name": "Zzz"}], [], []])
-    r = google.LAST_ROWS[0]
+    r = ROWS[-1]
     assert len(c.inputs) == 3 and r["google_name"] is None and r["google_match_score"] < 75
     assert r["google_scraped_at"] is not None and "hotels" in events
 
@@ -169,7 +177,7 @@ def test_never_found_stamped_with_last_query_and_best_kept(db):
 def test_uncertain_score_not_retried(db):
     events, _ = db
     c, _ = run([{"search_query": "Amankila Bali", "name": "Amankilo"}], [0.009], events=events)
-    assert len(c.inputs) == 1 and 75 <= google.LAST_ROWS[0]["google_match_score"] < 90
+    assert len(c.inputs) == 1 and 75 <= ROWS[-1]["google_match_score"] < 90
 
 
 def test_retry_keeps_best_across_stages(db):
@@ -177,7 +185,7 @@ def test_retry_keeps_best_across_stages(db):
     run(None, [0.009], events=events, per_run=[
         [{"search_query": "Amankila Bali", "name": "Amanda"}],
         [{"search_query": "Amankila", "name": "Zzz"}], [{"search_query": "hotels in Amankila Bali", "name": "Zzz"}]])
-    r = google.LAST_ROWS[0]
+    r = ROWS[-1]
     assert r["google_query"] == "Amankila Bali" and r["google_match_score"] > 0
 
 
@@ -198,3 +206,69 @@ def test_spend_guard_null_usage_and_cap():
         google.check_spend(C("abc", 1), CFG)
     with pytest.raises(RuntimeError, match="max_spend"):
         google.check_spend(C(None, 85), CFG)
+
+
+TWO = [(1, "Amankila", "bali"), (2, "Zeta Place", "bali")]
+HIT1 = {"search_query": "Amankila Bali", "name": "Amankila", "star_rating": 5}
+MISS2 = {"search_query": "Zeta Place Bali", "name": "Qqq"}
+
+
+def test_stage2_failure_keeps_stage1_hits_stamped_misses_not(db):
+    events, runs = db
+    with pytest.raises(RuntimeError, match="FAILED"):
+        c = FakeClient(None, [0.009], events=events)
+        c.per_run, c.statuses = [[HIT1, MISS2], []], ["SUCCEEDED", "FAILED"]
+        google.process_chunk(c, Conn(events), TWO, CFG)
+    assert [r["hotel_id"] for r in ROWS] == [1]
+    assert events.count("hotels") == 1
+
+
+def test_stage3_failure_keeps_earlier_stamps_no_double_stamp(db):
+    events, _ = db
+    other = [{"search_query": "Zeta Place", "name": "Zeta Place", "star_rating": 3}]
+    c = FakeClient(None, [0.009], events=events)
+    c.per_run, c.statuses = [[HIT1, MISS2], other, []], ["SUCCEEDED", "SUCCEEDED", "FAILED"]
+    google.process_chunk(c, Conn(events), TWO, CFG)  # all resolved by stage 2: stage 3 skipped
+    assert [r["hotel_id"] for r in ROWS] == [1, 2] and len(c.inputs) == 2
+    ROWS.clear()
+    c = FakeClient(None, [0.009], events=events)
+    c.per_run, c.statuses = [[HIT1, MISS2], [], []], ["SUCCEEDED", "SUCCEEDED", "FAILED"]
+    with pytest.raises(RuntimeError, match="FAILED"):
+        google.process_chunk(c, Conn(events), TWO, CFG)
+    assert [r["hotel_id"] for r in ROWS] == [1]
+
+
+def test_per_stage_order_upsert_commit_delete(db):
+    events, _ = db
+    c = FakeClient(None, [0.009], events=events)
+    c.per_run = [[HIT1, MISS2], [], []]
+    google.process_chunk(c, Conn(events), TWO, CFG)
+    i = events.index("hotels")
+    assert events[i:i + 3] == ["hotels", "commit", "delete"]
+    assert events.count("hotels") == 2  # stage 1 hit, then leftover miss at the end
+
+
+def test_query_forms_recorded_and_unknown_form_rejected(db):
+    events, runs = db
+    run([ITEM], [0.009], events=events)
+    assert runs[0]["input"]["query_forms"] == ["plain", "name_only", "prefixed"]
+    bad = CFG | {"google": CFG["google"] | {"query_forms": ["plain", "bogus"]}}
+    with pytest.raises(ValueError, match="bogus"):
+        run([ITEM], [0.009], cfg=bad, events=events)
+
+
+def test_skipped_stage_dedup_then_stage3(db):
+    events, runs = db
+    hotels = [(1, "Amankila Bali", "bali")]  # plain == name_only
+    c, _ = run(None, [0.009], hotels=hotels, events=events, per_run=[
+        [{"search_query": "Amankila Bali", "name": "Zzz"}],
+        [{"search_query": "hotels in Amankila Bali", "name": "Amankila Bali", "star_rating": 4}]])
+    assert [r["input"]["query_form"] for r in runs if "input" in r] == ["plain", "prefixed"]
+    assert ROWS[-1]["google_query"] == "hotels in Amankila Bali"
+
+
+def test_all_items_unmapped_at_retry_is_miss_with_warning(db, caplog):
+    events, _ = db
+    run(None, [0.009], events=events, per_run=[[{"search_query": "Amankila Bali", "name": "Zzz"}],
+                                               [{"search_query": "nope", "name": "Amankila"}], []])
+    assert "did not map" in caplog.text and ROWS[-1]["google_name"] is None

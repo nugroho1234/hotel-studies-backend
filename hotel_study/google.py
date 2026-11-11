@@ -44,8 +44,13 @@ def _wait_for_usage(client, run, g: dict):
         waited += g["usage_poll_seconds"]
 
 
+FORMS = {"plain", "name_only", "prefixed"}
+
+
 def form_query(form: str, name: str, destination: str, g: dict) -> str:
     """Names of the ladder stages (google.query_forms) -> query text."""
+    if form not in FORMS:
+        raise ValueError(f"unknown query form {form!r}")
     if form == "name_only":
         return name
     return (g["query_prefix"] if form == "prefixed" else "") + build_query(name, destination)
@@ -64,7 +69,7 @@ def _search(client, queries: list[str], cfg: dict, conn, form: str = "plain", al
     run = client.actor(ACTOR).start(run_input=run_input)
     # Provenance first, so an interrupted command can be traced.
     upsert(conn, "scrape_runs", [{"run_id": run.id, "actor": ACTOR, "pass": "google",
-                                  "input": run_input | {"query_form": form, "query_prefix": g["query_prefix"]},
+                                  "input": run_input | {"query_form": form, "query_forms": g["query_forms"], "query_prefix": g["query_prefix"]},
                                   "dataset_id": run.default_dataset_id, "started_at": datetime.now(timezone.utc)}], "run_id")
     conn.commit()
     run = client.run(run.id).wait_for_finish()
@@ -91,38 +96,52 @@ def _search(client, queries: list[str], cfg: dict, conn, form: str = "plain", al
 
 
 def process_chunk(client, conn, hotels: list[tuple[int, str, str]], cfg: dict) -> int:
-    """hotels = [(hotel_id, name, destination)]. Runs the query ladder (only misses go on), stamps hotels once at the end."""
+    """hotels = [(hotel_id, name, destination)]. Runs the query ladder; hotels resolved at a stage are stamped at once,
+    only misses go on, and the leftovers are stamped with their best result at the end. A failed stage keeps earlier stamps."""
     g = cfg["google"]
+    forms = g["query_forms"]
+    if bad := [f for f in forms if f not in FORMS]:
+        raise ValueError(f"unknown google.query_forms entries {bad}; allowed {sorted(FORMS)}")
     best = {h: None for h, _, _ in hotels}  # hotel_id -> (pick, query)
-    last_q, datasets = {}, []
-    for stage, form in enumerate(g["query_forms"]):
-        pending = [(h, n, form_query(form, n, d, g)) for h, n, d in hotels
-                   if (best[h] is None or is_miss(best[h][0], cfg)) and form_query(form, n, d, g) != last_q.get(h)]
-        if not pending:
-            continue
-        check_spend(conn, cfg)
-        items, dataset_id = _search(client, [q for _, _, q in pending], cfg, conn, form, allow_empty=stage > 0)
-        datasets.append(dataset_id)
-        by_query = group_results(items)
-        unmapped = [it for it in items if it.get("search_query") not in {q for _, _, q in pending}]
-        if items and len(unmapped) == len(items) and stage == 0:
-            raise RuntimeError("No Apify item maps to any query of this chunk; hotels left unstamped")
-        if unmapped:
-            log.warning("%d of %d Apify items did not map to a query", len(unmapped), len(items))
-        for h, n, q in pending:
-            last_q[h] = q
-            pick = pick_best(n, by_query.get(q, []), cfg["name_match"])
-            if best[h] is None or pick["google_match_score"] > best[h][0]["google_match_score"]:
-                best[h] = (pick, q)
-    now = datetime.now(timezone.utc)
-    rows = [{"hotel_id": h, "google_query": best[h][1] if best[h][0]["google_match_score"] > 0 else last_q[h],
-             "google_scraped_at": now, **best[h][0]} for h, _, _ in hotels]
-    upsert_rows(conn, rows)
-    conn.commit()
-    if cfg["delete_remote_datasets"]:  # only after the results are safely stored
-        for d in datasets:
-            client.dataset(d).delete()
-    return len(rows)
+    last_q, stamped = {}, set()
+
+    def stamp(ids, dataset_id=None):
+        now = datetime.now(timezone.utc)
+        rows = [{"hotel_id": h, "google_query": best[h][1] if best[h][0]["google_match_score"] > 0 else last_q[h],
+                 "google_scraped_at": now, **best[h][0]} for h in ids]
+        if rows:
+            upsert_rows(conn, rows)
+            conn.commit()
+            stamped.update(ids)
+        if dataset_id and cfg["delete_remote_datasets"]:  # only after the results are safely stored
+            client.dataset(dataset_id).delete()
+
+    try:
+        for stage, form in enumerate(forms):
+            pending = [(h, n, form_query(form, n, d, g)) for h, n, d in hotels
+                       if (best[h] is None or is_miss(best[h][0], cfg)) and form_query(form, n, d, g) != last_q.get(h)]
+            if not pending:
+                continue
+            check_spend(conn, cfg)
+            items, dataset_id = _search(client, [q for _, _, q in pending], cfg, conn, form, allow_empty=stage > 0)
+            by_query = group_results(items)
+            wanted = {q for _, _, q in pending}
+            unmapped = [it for it in items if it.get("search_query") not in wanted]
+            if items and len(unmapped) == len(items) and stage == 0:
+                raise RuntimeError("No Apify item maps to any query of this chunk; hotels left unstamped")
+            if unmapped:
+                log.warning("%d of %d Apify items did not map to a query", len(unmapped), len(items))
+            for h, n, q in pending:
+                last_q[h] = q
+                pick = pick_best(n, by_query.get(q, []), cfg["name_match"])
+                if best[h] is None or pick["google_match_score"] > best[h][0]["google_match_score"]:
+                    best[h] = (pick, q)
+            stamp([h for h, _, _ in pending if not is_miss(best[h][0], cfg)], dataset_id)
+        stamp([h for h, _, _ in hotels if h not in stamped])
+    except Exception:
+        log.warning("google ladder failed: %d hotels saved, %d left unstamped", len(stamped), len(hotels) - len(stamped))
+        raise
+    return len(stamped)
 
 
 def run_google_stars(limit: int | None = None, destination: str | None = None) -> dict:
