@@ -1,3 +1,6 @@
+import pytest
+
+from hotel_study import google
 from hotel_study.google import group_results
 
 
@@ -6,10 +9,6 @@ def test_group_results_by_search_query():
     g = group_results(items)
     assert [i["name"] for i in g["a"]] == ["1", "3"] and len(g["b"]) == 1
 
-
-import pytest
-
-from hotel_study import google
 
 CFG = {"google": {"top_results": 3, "hl": "en", "gl": "id", "fetch_details": False, "query_prefix": "",
                   "usage_poll_seconds": 1, "usage_max_wait_seconds": 3},
@@ -52,15 +51,18 @@ class FakeClient:
 
 
 class Conn:
+    def __init__(self, events=None):
+        self.events = events if events is not None else []
+
     def commit(self):
-        pass
+        self.events.append("commit")
 
 
 @pytest.fixture
 def db(monkeypatch):
     events, runs = [], []
     monkeypatch.setattr(google, "upsert", lambda conn, t, rows, k: runs.append(rows[0]))
-    monkeypatch.setattr(google, "upsert_rows", lambda conn, rows: events.append(("hotels", rows)))
+    monkeypatch.setattr(google, "upsert_rows", lambda conn, rows: events.append("hotels"))
     monkeypatch.setattr(google.time, "sleep", lambda s: None)
     return events, runs
 
@@ -72,57 +74,72 @@ ITEM = {"search_query": "Amankila Bali", "name": "Amankila", "star_rating": 5}
 def test_usage_poll_succeeds_after_retries(db):
     events, runs = db
     c = FakeClient([ITEM], [0.0, 0.0, 0.009], events=events)
-    assert google.process_chunk(c, Conn(), CHUNK, CFG) == 1
+    assert google.process_chunk(c, Conn(events), CHUNK, CFG) == 1
     assert runs[-1]["usage_usd"] == 0.009
 
 
-def test_usage_missing_raises_and_never_writes_zero(db):
+def test_items_but_usage_unconfirmed_raises_and_leaves_null(db):
     events, runs = db
-    c = FakeClient([ITEM], [0.0], events=events)
     with pytest.raises(RuntimeError, match="usage"):
-        google.process_chunk(c, Conn(), CHUNK, CFG)
-    assert "usage_usd" not in runs[-1] and not events
+        google.process_chunk(FakeClient([ITEM], [0.0], events=events), Conn(events), CHUNK, CFG)
+    assert "usage_usd" not in runs[-1] and "hotels" not in events
 
 
-def test_failed_run_leaves_hotels_unstamped(db):
+def test_failed_run_unstamped_records_observed_usage(db):
     events, runs = db
     with pytest.raises(RuntimeError, match="FAILED"):
-        google.process_chunk(FakeClient([], [0.0], status="FAILED", events=events), Conn(), CHUNK, CFG)
-    assert not events and "finished_at" in runs[-1]
+        google.process_chunk(FakeClient([], [0.0], status="FAILED", events=events), Conn(events), CHUNK, CFG)
+    assert "hotels" not in events and "finished_at" in runs[-1] and runs[-1]["usage_usd"] == 0.0
 
 
-def test_delete_after_hotels_upsert(db):
+def test_zero_items_timeout_records_observed_and_aborts(db):
+    events, runs = db
+    with pytest.raises(RuntimeError, match="no items"):
+        google.process_chunk(FakeClient([], [0.0], events=events), Conn(events), CHUNK, CFG)
+    assert "hotels" not in events and runs[-1]["usage_usd"] == 0.0 and runs[-1]["item_count"] == 0
+
+
+def test_delete_after_hotels_upsert_and_commit(db):
     events, _ = db
-    google.process_chunk(FakeClient([ITEM], [0.009], events=events), Conn(), CHUNK, CFG)
-    assert [e if isinstance(e, str) else e[0] for e in events] == ["hotels", "delete"]
+    google.process_chunk(FakeClient([ITEM], [0.009], events=events), Conn(events), CHUNK, CFG)
+    assert events[-3:] == ["hotels", "commit", "delete"]
 
 
 def test_all_items_unmapped_aborts(db):
     events, _ = db
     with pytest.raises(RuntimeError, match="maps to any query"):
-        google.process_chunk(FakeClient([{"search_query": "zzz", "name": "x"}], [0.003], events=events), Conn(), CHUNK, CFG)
-    assert events == []
+        google.process_chunk(FakeClient([{"search_query": "zzz", "name": "x"}], [0.003], events=events), Conn(events), CHUNK, CFG)
+    assert "hotels" not in events
 
 
-def test_query_prefix_recorded_and_applied(db, monkeypatch):
-    from hotel_study.matching import build_query
-    assert "hotels in " + build_query("Alila Seminyak", "bali") == "hotels in Alila Seminyak Bali"
+def test_chunk_queries_prefix_empty_and_set():
+    hotels = [(1, "Alila Seminyak", "bali")]
+    assert google.chunk_queries(hotels, CFG) == [(1, "Alila Seminyak", "Alila Seminyak Bali")]
+    cfg = CFG | {"google": CFG["google"] | {"query_prefix": "hotels in "}}
+    assert google.chunk_queries(hotels, cfg)[0][2] == "hotels in Alila Seminyak Bali"
+
+
+def test_prefix_recorded_in_run_input(db):
     events, runs = db
-    google.process_chunk(FakeClient([ITEM], [0.009], events=events), Conn(), CHUNK,
-                         CFG | {"google": CFG["google"] | {"query_prefix": "hotels in "}})
+    cfg = CFG | {"google": CFG["google"] | {"query_prefix": "hotels in "}}
+    google.process_chunk(FakeClient([ITEM], [0.009], events=events), Conn(events), CHUNK, cfg)
     assert runs[0]["input"]["query_prefix"] == "hotels in "
 
 
 def test_spend_guard_null_usage_and_cap():
     class C:
-        def __init__(self, a, b): self.v = [a, b]
+        def __init__(self, missing, spent):
+            self.missing, self.spent = missing, spent
+
         def execute(self, q):
             self.q = q
             return self
+
         def fetchone(self):
-            return (self.v[0] if "count" in self.q else self.v[1],)
-    google.check_spend(C(0, 1), CFG)
-    with pytest.raises(RuntimeError, match="NULL"):
-        google.check_spend(C(1, 1), CFG)
+            return (self.missing,) if "run_id" in self.q and self.missing else None if "run_id" in self.q else (self.spent,)
+
+    google.check_spend(C(None, 1), CFG)
+    with pytest.raises(RuntimeError, match="where run_id = 'abc'"):
+        google.check_spend(C("abc", 1), CFG)
     with pytest.raises(RuntimeError, match="max_spend"):
-        google.check_spend(C(0, 85), CFG)
+        google.check_spend(C(None, 85), CFG)

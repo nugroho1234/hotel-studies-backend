@@ -23,30 +23,34 @@ def group_results(items: list[dict]) -> dict[str, list[dict]]:
 
 def check_spend(conn, cfg: dict) -> None:
     """Raise if a finished run has no usage recorded, or the spend cap is reached."""
-    missing = conn.execute("SELECT count(*) FROM scrape_runs WHERE finished_at IS NOT NULL AND usage_usd IS NULL").fetchone()[0]
-    if missing:
-        raise RuntimeError(f"{missing} finished scrape_runs row(s) have NULL usage_usd; fix them before spending more")
+    row = conn.execute("SELECT run_id FROM scrape_runs WHERE finished_at IS NOT NULL AND usage_usd IS NULL LIMIT 1").fetchone()
+    if row:
+        raise RuntimeError(f"scrape_runs row {row[0]} is finished but has NULL usage_usd. Read its cost in the Apify console, then run: "
+                           f"update scrape_runs set usage_usd = <value> where run_id = '{row[0]}'")
     spent = conn.execute("SELECT coalesce(sum(usage_usd), 0) FROM scrape_runs").fetchone()[0]
     if spent >= cfg["max_spend_usd"]:
         raise RuntimeError(f"max_spend_usd {cfg['max_spend_usd']} reached (spent {spent})")
 
 
-def _wait_for_usage(client, run, n_items: int, g: dict):
-    """Usage is filled in seconds after a run ends (0.0 at first), so with items we wait for > 0."""
+def _wait_for_usage(client, run, g: dict):
+    """Apify reports usage 0.0 right after a run ends, so poll until > 0 or the max wait; returns the last observed value."""
     waited = 0
     while True:
         run = client.run(run.id).get()
         u = run.usage_total_usd
-        if u is not None and (u > 0 or n_items == 0):
+        if (u is not None and u > 0) or waited >= g["usage_max_wait_seconds"]:
             return run, u
-        if waited >= g["usage_max_wait_seconds"]:
-            return run, None
         time.sleep(g["usage_poll_seconds"])
         waited += g["usage_poll_seconds"]
 
 
+def chunk_queries(hotels: list[tuple], cfg: dict) -> list[tuple[int, str, str]]:
+    """hotels = [(hotel_id, hotel_name, destination)] -> [(hotel_id, hotel_name, query)], prefix applied."""
+    return [(h, n, cfg["google"]["query_prefix"] + build_query(n, d)) for h, n, d in hotels]
+
+
 def _search(client, queries: list[str], cfg: dict, conn):
-    """Start the run, record provenance, return (items, dataset_id). Raises on failure; never writes usage 0 for a missing value."""
+    """Start the run, record provenance, return (items, dataset_id). Raises on failure; never writes usage 0 for an unconfirmed run that returned items."""
     g = cfg["google"]
     run_input = {"queries": queries, "max_results_per_query": g["top_results"], "hl": g["hl"], "gl": g["gl"],
                  "fetch_details": g["fetch_details"]}
@@ -59,16 +63,21 @@ def _search(client, queries: list[str], cfg: dict, conn):
     run = client.run(run.id).wait_for_finish()
     ok = str(getattr(run.status, "value", run.status)) == "SUCCEEDED"
     items = list(client.dataset(run.default_dataset_id).iterate_items()) if ok else []
-    run, usage = _wait_for_usage(client, run, len(items), g)
+    run, usage = _wait_for_usage(client, run, g)
+    confirmed = usage is not None and usage > 0
     row = {"run_id": run.id, "actor": ACTOR, "finished_at": datetime.now(timezone.utc), "item_count": len(items)}
-    if usage is not None:
+    if confirmed or (not items and usage is not None):  # zero-item/failed runs may genuinely cost 0
         row["usage_usd"] = usage
+    if not confirmed:
+        log.warning("Apify run %s: usage unconfirmed after %ss (observed %s)", run.id, g["usage_max_wait_seconds"], usage)
     upsert(conn, "scrape_runs", [row], "run_id")
     conn.commit()
     if not ok:
         raise RuntimeError(f"Apify run {run.id} ended with status {run.status}")
-    if usage is None:
-        raise RuntimeError(f"Apify run {run.id}: usage not reported within {g['usage_max_wait_seconds']}s; usage_usd left NULL")
+    if not items:
+        raise RuntimeError(f"Apify run {run.id} returned no items; hotels left unstamped (check the actor and queries)")
+    if not confirmed:
+        raise RuntimeError(f"Apify run {run.id}: usage not confirmed within {g['usage_max_wait_seconds']}s; usage_usd left NULL")
     return items, run.default_dataset_id
 
 
@@ -78,7 +87,7 @@ def process_chunk(client, conn, chunk: list[tuple[int, str, str]], cfg: dict) ->
     by_query = group_results(items)
     wanted = {q for _, _, q in chunk}
     unmapped = [it for it in items if it.get("search_query") not in wanted]
-    if items and len(unmapped) == len(items):
+    if len(unmapped) == len(items):
         raise RuntimeError("No Apify item maps to any query of this chunk; hotels left unstamped")
     if unmapped:
         log.warning("%d of %d Apify items did not map to a query", len(unmapped), len(items))
@@ -112,7 +121,7 @@ def run_google_stars(limit: int | None = None, destination: str | None = None) -
         hotels = conn.execute(sql, args).fetchall()
         for i in range(0, len(hotels), n):
             check_spend(conn, cfg)
-            chunk = [(h, name, cfg["google"]["query_prefix"] + build_query(name, d)) for h, name, d in hotels[i:i + n]]
+            chunk = chunk_queries(hotels[i:i + n], cfg)
             done += process_chunk(client, conn, chunk, cfg)
             runs += 1
     return {"hotels": done, "runs": runs}
