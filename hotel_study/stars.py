@@ -132,11 +132,11 @@ def compare_stars(limit: int | None = None, destination: str | None = None, over
             status, final = star_status(h["google_star_rating"], h["star_class"], h["google_match_score"], accept)
             g = h["google_star_rating"]
             diff = None if g is None else g - h["star_class"]
-            upd.append({"hotel_id": h["hotel_id"], "star_diff": diff, "star_check_status": status, "final_star_rating": final})
+            upd.append({"hotel_id": h["hotel_id"], "star_diff": diff, "star_check_status": status, "final_star_rating": final, "in_sample_frame": final is not None})
             rows.append(h | {"star_diff": diff, "star_check_status": status})
         with conn.cursor() as c:
             c.executemany("UPDATE hotels SET star_diff=%(star_diff)s, star_check_status=%(star_check_status)s, "
-                          "final_star_rating=%(final_star_rating)s, in_sample_frame=(%(final_star_rating)s IS NOT NULL) WHERE hotel_id=%(hotel_id)s", upd)
+                          "final_star_rating=%(final_star_rating)s, in_sample_frame=%(in_sample_frame)s WHERE hotel_id=%(hotel_id)s", upd)
         conn.commit()
     OUT.mkdir(exist_ok=True)
     rows.sort(key=lambda r: (r["star_check_status"] not in NEEDS_CHECK, r["destination"], r["hotel_id"]))

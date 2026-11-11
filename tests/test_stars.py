@@ -148,3 +148,32 @@ def test_plan_finalise_outside_subset_ignored_but_unknown_reported():
         plan_finalise([dict(hotel_id="8", match_confirmed="y"), dict(hotel_id="abc")], {}, {7}, T)
     assert len(e.value.items) == 2
     assert plan_finalise([dict(hotel_id="7", match_confirmed="y")], {}, {7}, T) == []
+
+
+def test_compare_passes_bool_in_sample_frame(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from hotel_study import stars
+    monkeypatch.setattr(stars, "OUT", tmp_path)
+    monkeypatch.setattr(stars, "load_config", lambda: {"name_match": {"accept": 90}})
+    cols = ["hotel_id", "hotel_name", "destination", "star_class", "google_name", "google_star_rating",
+            "google_match_score", "google_scraped_at", "num_reviews_ge_100", "star_check_status"]
+    recs = [(1, "A", "bali", 4, None, None, 0.0, "t", True, None), (2, "B", "bali", 4, "B", 4, 100.0, "t", True, None)]
+    seen = []
+
+    class Cur:
+        description = [SimpleNamespace(name=c) for c in cols]
+        def fetchall(self): return recs
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def executemany(self, q, params): seen.extend(params)
+
+    class Conn(Cur):
+        def execute(self, *a): return Cur()
+        def cursor(self): return Cur()
+        def commit(self): pass
+
+    monkeypatch.setattr(stars, "connect", lambda: Conn())
+    stars.compare_stars()
+    got = {p["hotel_id"]: p for p in seen}
+    assert got[1]["in_sample_frame"] is False and got[1]["final_star_rating"] is None
+    assert got[2]["in_sample_frame"] is True and got[2]["final_star_rating"] == 4
