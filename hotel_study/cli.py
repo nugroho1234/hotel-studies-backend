@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Annotated
 
 import typer
@@ -27,3 +28,11 @@ def init_db() -> None:
     with connect() as conn:
         apply_schema(conn)
     typer.echo("Schema applied.")
+
+
+@app.command("load-hotels")
+def load_hotels_cmd(csv: Path, limit: Limit = None, destination: Destination = None) -> None:
+    """Load the hotel CSV into the hotels table (safe to rerun)."""
+    from hotel_study.hotels import load_hotels
+
+    typer.echo(load_hotels(csv, limit, destination))
