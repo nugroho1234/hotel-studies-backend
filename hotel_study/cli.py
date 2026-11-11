@@ -44,3 +44,23 @@ def google_stars(limit: Limit = None, destination: Destination = None) -> None:
     from hotel_study.google import run_google_stars
 
     typer.echo(run_google_stars(limit, destination))
+
+
+@app.command("compare-stars")
+def compare_stars_cmd(limit: Limit = None, destination: Destination = None) -> None:
+    """Compare Google and TripAdvisor star classes; write output/*.csv."""
+    from hotel_study.stars import compare_stars
+
+    typer.echo(compare_stars(limit, destination))
+
+
+@app.command("finalise-stars")
+def finalise_stars_cmd(csv: Path, limit: Limit = None, destination: Destination = None) -> None:
+    """Apply the filled manual_checks.csv and set final_star_rating / in_sample_frame."""
+    from hotel_study.stars import OpenManualChecks, finalise_stars
+
+    try:
+        typer.echo(finalise_stars(csv, limit, destination))
+    except OpenManualChecks as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(1)
