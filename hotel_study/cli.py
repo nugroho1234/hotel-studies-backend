@@ -17,3 +17,13 @@ def same_destination(a: str, b: str | None) -> bool:
 @app.callback()
 def main() -> None:
     """Hotel study pipeline."""
+
+
+@app.command("init-db")
+def init_db() -> None:
+    """Create the tables if missing (safe to rerun)."""
+    from hotel_study.db import apply_schema, connect
+
+    with connect() as conn:
+        apply_schema(conn)
+    typer.echo("Schema applied.")
