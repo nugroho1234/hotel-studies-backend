@@ -1,0 +1,20 @@
+# All study parameters (PRD section 2). Read at runtime; never hard-code.
+seed: 42
+star_classes: [3, 4, 5]
+review_window: {start: "2023-01-01", end: "2025-12-31"}
+languages: [en, id]
+prescreen: {num_reviews_gt: 100}
+eligibility: {threshold: 100}
+ceiling: 30
+eligibility_test_size: 3
+reviews_per_hotel: 300
+google: {top_results: 3, hl: en, gl: id, fetch_details: false}
+name_match: {accept: 90, uncertain: 75}
+batch_size: 10
+concurrency: 1
+end_page: null          # set by hand after the eligibility test
+max_spend_usd: 85
+delete_remote_datasets: true
+pilot_size: 100
+pilot_min_id: 20
+google_prescreen_only: true
