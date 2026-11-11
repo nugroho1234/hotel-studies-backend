@@ -6,14 +6,15 @@ from hotel_study.db import connect
 
 OUT = ROOT / "output"
 NEEDS_CHECK = ("match_uncertain", "needs_manual_check")
+MANUAL_COLS = ("match_confirmed", "manual_google_star", "ta_displayed_class")
 
 
 class OpenManualChecks(Exception):
     """items = [(hotel_id, reason)]; refuses finalise before anything is written."""
 
-    def __init__(self, items: list[tuple]):
+    def __init__(self, items: list[tuple], summary: str = ""):
         self.items = items
-        super().__init__("finalise-stars refused:\n" + "\n".join(f"  {i}: {r}" for i, r in items))
+        super().__init__("finalise-stars refused. " + summary + "\n" + "\n".join(f"  {i}: {r}" for i, r in items))
 
 
 def star_status(google: int | None, ta: int, match_score: float | None, accept_threshold: float) -> tuple[str, int | None]:
@@ -43,7 +44,7 @@ def _resolve(row: dict, uncertain: bool) -> tuple[str, int | None, int | None, f
         raise ValueError(f"match_confirmed must be y or n, got {mc!r}")
     if mc == "n":
         google = _int_cell(cell("manual_google_star")) if cell("manual_google_star") else None
-    status, final = star_status(google, star, None, 0)
+    status, final = star_status(google, star, None, accept_threshold=0)  # score None: match already resolved, threshold unused
     diff = None if google is None else google - star
     ta = None
     if status == "needs_manual_check":
@@ -61,12 +62,12 @@ def resolve_manual(row: dict, uncertain: bool = False) -> tuple[str, int | None]
     return _resolve(row, uncertain)[:2]
 
 
-def plan_finalise(csv_rows: list[dict], hotels: dict[int, dict], all_ids: set[int], accept: float) -> list[dict]:
+def plan_finalise(csv_rows: list[dict], hotels: dict[int, dict], all_ids: set[int], accept: float, check_unchecked: bool = True) -> list[dict]:
     """hotels = the hotels in scope, keyed by id. Returns UPDATE dicts, or raises OpenManualChecks."""
     unchecked = [h for h, v in hotels.items() if v["num_reviews_ge_100"] and v["star_check_status"] is None]
-    if unchecked:
-        raise OpenManualChecks([(h, "pre-screened but not yet checked") for h in unchecked] +
-                               [("-", f"{len(unchecked)} pre-screened hotel(s) not yet checked; run google-stars and compare-stars first")])
+    if check_unchecked and unchecked:  # skipped for --limit/--destination test runs
+        raise OpenManualChecks([(h, "pre-screened but not yet checked") for h in unchecked],
+                               f"{len(unchecked)} pre-screened hotel(s) not yet checked; run google-stars and compare-stars first.")
     errors, by_id = [], {}
     for r in csv_rows:
         try:
@@ -89,7 +90,7 @@ def plan_finalise(csv_rows: list[dict], hotels: dict[int, dict], all_ids: set[in
             errors.append((i, "needs a manual check but is missing from the CSV"))
             continue
         try:
-            st, final, diff, ta = _resolve(h | by_id[i], status == "match_uncertain")
+            st, final, diff, ta = _resolve(h | {k: by_id[i].get(k) for k in MANUAL_COLS}, status == "match_uncertain")
         except ValueError as e:
             errors.append((i, str(e)))
             continue
@@ -109,7 +110,16 @@ def _scope(destination, limit) -> tuple[str, list, str]:
 COLS = "hotel_id, hotel_name, destination, star_class, google_name, google_star_rating, google_match_score, google_scraped_at, num_reviews_ge_100, star_check_status"
 
 
-def compare_stars(limit: int | None = None, destination: str | None = None) -> dict:
+def _has_manual_work(path: Path) -> bool:
+    if not path.exists():
+        return False
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        return any((r.get(c) or "").strip() for r in csv.DictReader(f) for c in MANUAL_COLS)
+
+
+def compare_stars(limit: int | None = None, destination: str | None = None, overwrite: bool = False) -> dict:
+    if not overwrite and _has_manual_work(OUT / "manual_checks.csv"):
+        raise RuntimeError("output/manual_checks.csv already contains manual entries; rerunning would destroy them. Pass --overwrite to replace it.")
     accept = load_config()["name_match"]["accept"]
     where, args, lim = _scope(destination, limit)
     sql = f"SELECT {COLS} FROM hotels WHERE google_scraped_at IS NOT NULL AND {where} ORDER BY hotel_id{lim}"
@@ -126,7 +136,7 @@ def compare_stars(limit: int | None = None, destination: str | None = None) -> d
             rows.append(h | {"star_diff": diff, "star_check_status": status})
         with conn.cursor() as c:
             c.executemany("UPDATE hotels SET star_diff=%(star_diff)s, star_check_status=%(star_check_status)s, "
-                          "final_star_rating=%(final_star_rating)s WHERE hotel_id=%(hotel_id)s", upd)
+                          "final_star_rating=%(final_star_rating)s, in_sample_frame=(%(final_star_rating)s IS NOT NULL) WHERE hotel_id=%(hotel_id)s", upd)
         conn.commit()
     OUT.mkdir(exist_ok=True)
     rows.sort(key=lambda r: (r["star_check_status"] not in NEEDS_CHECK, r["destination"], r["hotel_id"]))
@@ -162,7 +172,7 @@ def finalise_stars(csv_path: Path, limit: int | None = None, destination: str | 
             h["google_scraped"] = h["google_scraped_at"] is not None
             hotels[h["hotel_id"]] = h
         all_ids = {r[0] for r in conn.execute("SELECT hotel_id FROM hotels").fetchall()}
-        updates = plan_finalise(csv_rows, hotels, all_ids, accept)  # raises before any write
+        updates = plan_finalise(csv_rows, hotels, all_ids, accept, check_unchecked=not (limit or destination))  # raises before any write
         with conn.cursor() as c:
             c.executemany("UPDATE hotels SET star_check_status=%(star_check_status)s, final_star_rating=%(final_star_rating)s, "
                           "star_diff=%(star_diff)s, ta_displayed_class=%(ta_displayed_class)s WHERE hotel_id=%(hotel_id)s", updates)

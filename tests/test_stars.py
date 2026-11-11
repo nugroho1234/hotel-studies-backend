@@ -95,8 +95,52 @@ def test_plan_finalise_refuses_with_all_problems_listed():
 
 def test_plan_finalise_refuses_unchecked_prescreened():
     hotels = {1: hotel(star_check_status=None), 2: hotel()}
-    with pytest.raises(OpenManualChecks, match="1 .*not.*checked"):
+    with pytest.raises(OpenManualChecks, match="1 pre-screened hotel.*not yet checked") as e:
         plan_finalise([], hotels, set(hotels), T)
+    assert e.value.items == [(1, "pre-screened but not yet checked")]
+    assert plan_finalise([], hotels, set(hotels), T, check_unchecked=False) == []  # scoped test run
+
+
+COMPARE_COLS = dict(hotel_name="X", destination="bali", google_name="", star_diff="", star_check_status="match_uncertain")
+
+
+def test_plan_finalise_with_csv_rows_shaped_like_compare_stars():
+    hotels = {1: hotel(google_match_score=0.0, google_star_rating=None, star_check_status="match_uncertain"),
+              2: hotel(google_match_score=80.0, google_star_rating=5, star_check_status="match_uncertain")}
+    csv = [dict(COMPARE_COLS, hotel_id="1", star_class="4", google_star_rating="", match_confirmed="y", manual_google_star="", ta_displayed_class=""),
+           dict(COMPARE_COLS, hotel_id="2", star_class="4", google_star_rating="5", star_diff="1", match_confirmed="y",
+                manual_google_star="", ta_displayed_class="4.5")]
+    out = {u["hotel_id"]: u for u in plan_finalise(csv, hotels, set(hotels), T)}
+    assert out[1]["star_check_status"] == "google_missing" and out[1]["final_star_rating"] == 4 and out[1]["star_diff"] is None
+    assert out[2]["star_check_status"] == "agree_half_star"
+
+
+def test_plan_finalise_manual_star_reaching_plus_one_needs_ta():
+    hotels = {1: hotel(google_match_score=80.0, google_star_rating=2, star_check_status="match_uncertain")}
+    csv = [dict(hotel_id="1", star_class="4", match_confirmed="n", manual_google_star="5", ta_displayed_class="")]
+    with pytest.raises(OpenManualChecks, match="ta_displayed_class"):
+        plan_finalise(csv, hotels, set(hotels), T)
+    csv[0]["ta_displayed_class"] = "4.0"
+    assert plan_finalise(csv, hotels, set(hotels), T)[0]["star_check_status"] == "disagree"
+
+
+def test_plan_finalise_hotel_missing_from_csv_is_listed():
+    hotels = {1: hotel(google_match_score=80.0, star_check_status="match_uncertain")}
+    with pytest.raises(OpenManualChecks) as e:
+        plan_finalise([], hotels, set(hotels), T)
+    assert e.value.items[0][0] == 1
+
+
+def test_compare_refuses_to_overwrite_manual_work(tmp_path, monkeypatch):
+    from hotel_study import stars
+    monkeypatch.setattr(stars, "OUT", tmp_path)
+    p = tmp_path / "manual_checks.csv"
+    p.write_text("hotel_id,match_confirmed,manual_google_star,ta_displayed_class\n1,,,\n")
+    assert not stars._has_manual_work(p)
+    p.write_text("hotel_id,match_confirmed,manual_google_star,ta_displayed_class\n1,y,,\n")
+    assert stars._has_manual_work(p)
+    with pytest.raises(RuntimeError, match="--overwrite"):
+        stars.compare_stars()  # refuses before touching the DB
 
 
 def test_plan_finalise_outside_subset_ignored_but_unknown_reported():

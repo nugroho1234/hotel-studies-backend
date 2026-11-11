@@ -47,11 +47,16 @@ def google_stars(limit: Limit = None, destination: Destination = None) -> None:
 
 
 @app.command("compare-stars")
-def compare_stars_cmd(limit: Limit = None, destination: Destination = None) -> None:
+def compare_stars_cmd(limit: Limit = None, destination: Destination = None,
+                      overwrite: Annotated[bool, typer.Option("--overwrite", help="Replace manual_checks.csv even if it holds manual entries")] = False) -> None:
     """Compare Google and TripAdvisor star classes; write output/*.csv."""
     from hotel_study.stars import compare_stars
 
-    typer.echo(compare_stars(limit, destination))
+    try:
+        typer.echo(compare_stars(limit, destination, overwrite))
+    except RuntimeError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(1)
 
 
 @app.command("finalise-stars")
