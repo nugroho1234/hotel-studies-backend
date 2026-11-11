@@ -32,10 +32,10 @@ def test_no_id_and_bad_values_skipped():
     assert counts["skipped_no_id"] == 1 and counts["skipped_bad_value"] == 2
 
 
-def test_gt_threshold_and_blank_cells():
-    rows, _ = build_rows(frame({"review_url": url(1), "num_reviews": "100"}, {"review_url": url(2), "num_reviews": "101"},
+def test_ge_threshold_and_blank_cells():
+    rows, _ = build_rows(frame({"review_url": url(1), "num_reviews": "99"}, {"review_url": url(2), "num_reviews": "100"},
                                 {"review_url": url(3), "num_reviews": "", "address": ""}), 100)
-    assert [r["num_reviews_gt_100"] for r in rows] == [False, True, False]
+    assert [r["num_reviews_ge_100"] for r in rows] == [False, True, False]
     assert rows[2]["num_reviews"] is None
 
 

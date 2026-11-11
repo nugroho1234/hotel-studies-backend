@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS hotels (
   num_reviews integer CHECK (num_reviews >= 0),
   review_url text NOT NULL UNIQUE,
   address text,
-  num_reviews_gt_100 boolean NOT NULL DEFAULT false,
+  num_reviews_ge_100 boolean NOT NULL DEFAULT false,
   google_query text,
   google_name text,
   google_detail_url text,

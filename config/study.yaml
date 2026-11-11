@@ -3,7 +3,7 @@ seed: 42
 star_classes: [3, 4, 5]
 review_window: {start: "2023-01-01", end: "2025-12-31"}
 languages: [en, id]
-prescreen: {num_reviews_gt: 100}
+prescreen: {num_reviews_ge: 100}
 eligibility: {threshold: 100}
 ceiling: 30
 eligibility_test_size: 3

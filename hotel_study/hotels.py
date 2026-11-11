@@ -44,7 +44,7 @@ def build_rows(df: pd.DataFrame, threshold: int, limit: int | None = None,
             "hotel_id": hid, "date_scraped": r["date_scraped"] or None, "hotel_name": r["hotel_name"],
             "destination": r["destination"], "star_class": star, "num_reviews": n,
             "review_url": r["review_url"], "address": r["address"] or None,
-            "num_reviews_gt_100": n is not None and n > threshold,
+            "num_reviews_ge_100": n is not None and n >= threshold,
         }
     counts["loaded"] = len(rows)
     return list(rows.values()), counts
@@ -52,7 +52,7 @@ def build_rows(df: pd.DataFrame, threshold: int, limit: int | None = None,
 
 def load_hotels(csv_path, limit: int | None = None, destination: str | None = None) -> dict:
     df = pd.read_csv(csv_path, encoding="utf-8-sig", dtype=str, keep_default_na=False)
-    rows, counts = build_rows(df, load_config()["prescreen"]["num_reviews_gt"], limit, destination)
+    rows, counts = build_rows(df, load_config()["prescreen"]["num_reviews_ge"], limit, destination)
     # Separate calls so rows without a flag never overwrite star_check_status (upsert uses rows[0] keys).
     plain = [r for r in rows if "star_check_status" not in r]
     flagged = [r for r in rows if "star_check_status" in r]
