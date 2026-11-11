@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS hotels (
   star_diff smallint,
   star_check_status text CHECK (star_check_status IN
     ('agree','agree_half_star','disagree','google_missing','needs_manual_check','match_uncertain')),
-  ta_displayed_class numeric CHECK (ta_displayed_class BETWEEN 1 AND 5),
+  ta_displayed_class numeric(2,1) CHECK (ta_displayed_class BETWEEN 1 AND 5),
   final_star_rating smallint CHECK (final_star_rating BETWEEN 1 AND 5),
   in_sample_frame boolean NOT NULL DEFAULT false,
   cell_order smallint CHECK (cell_order >= 1),
@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS scrape_runs (
   started_at timestamptz,
   finished_at timestamptz,
   item_count integer CHECK (item_count >= 0),
-  usage_usd numeric CHECK (usage_usd >= 0)
+  usage_usd numeric(10,4) CHECK (usage_usd >= 0)
 );
 
 CREATE TABLE IF NOT EXISTS reviews (

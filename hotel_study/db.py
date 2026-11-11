@@ -1,7 +1,6 @@
-from pathlib import Path
-
 import psycopg
 from psycopg import sql
+from psycopg.types.json import Jsonb
 
 from hotel_study.config import ROOT, get_secret
 
@@ -30,5 +29,5 @@ def upsert(conn: psycopg.Connection, table: str, rows: list[dict], key: str | li
     q = sql.SQL("INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) {}").format(
         sql.Identifier(table), ident(cols), sql.SQL(", ").join(sql.Placeholder(c) for c in cols), ident(keys), action)
     with conn.cursor() as cur:
-        cur.executemany(q, rows)
+        cur.executemany(q, [{c: Jsonb(v) if isinstance(v, dict) else v for c, v in r.items()} for r in rows])
     return len(rows)

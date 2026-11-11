@@ -22,3 +22,12 @@ def test_upsert_twice_creates_one_row():
                                (row["hotel_id"],)).fetchone()
         conn.rollback()
     assert (n, name) == (1, "T2")
+
+
+def test_upsert_jsonb_dict_roundtrips():
+    inp = {"startUrls": [{"url": "u"}], "since": "2023-01-01"}
+    with connect() as conn:
+        upsert(conn, "scrape_runs", [{"run_id": "test-run-jsonb", "actor": "a", "pass": "1", "input": inp}], "run_id")
+        got = conn.execute("select input from scrape_runs where run_id='test-run-jsonb'").fetchone()[0]
+        conn.rollback()
+    assert got == inp
