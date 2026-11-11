@@ -36,3 +36,11 @@ def load_hotels_cmd(csv: Path, limit: Limit = None, destination: Destination = N
     from hotel_study.hotels import load_hotels
 
     typer.echo(load_hotels(csv, limit, destination))
+
+
+@app.command("google-stars")
+def google_stars(limit: Limit = None, destination: Destination = None) -> None:
+    """Look up Google star rating for pre-screened hotels."""
+    from hotel_study.google import run_google_stars
+
+    typer.echo(run_google_stars(limit, destination))
