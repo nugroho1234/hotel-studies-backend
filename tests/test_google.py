@@ -10,7 +10,7 @@ def test_group_results_by_search_query():
     assert [i["name"] for i in g["a"]] == ["1", "3"] and len(g["b"]) == 1
 
 
-CFG = {"google": {"top_results": 3, "hl": "en", "gl": "id", "fetch_details": False, "query_prefix": "",
+CFG = {"google": {"top_results": 3, "hl": "en", "gl": "id", "fetch_details": False, "query_prefix": "hotels in ", "query_forms": ["plain", "name_only", "prefixed"],
                   "usage_poll_seconds": 1, "usage_max_wait_seconds": 3},
        "name_match": {"accept": 90, "uncertain": 75}, "delete_remote_datasets": True, "max_spend_usd": 85}
 
@@ -22,13 +22,20 @@ class R:
 
 class FakeClient:
     def __init__(self, items, usages, status="SUCCEEDED", events=None):
+        # items: one list for every run, or a list of lists via runs=
         self.items, self.usages, self.status, self.events = items, list(usages), status, events if events is not None else []
+        self.inputs = []
+
+    per_run = None
 
     def actor(self, _):
         return self
 
     def start(self, run_input):
         self.run_input = run_input
+        self.inputs.append(run_input)
+        if self.per_run:
+            self.items = self.per_run.pop(0)
         return R()
 
     def run(self, _):
@@ -62,68 +69,114 @@ class Conn:
 def db(monkeypatch):
     events, runs = [], []
     monkeypatch.setattr(google, "upsert", lambda conn, t, rows, k: runs.append(rows[0]))
-    monkeypatch.setattr(google, "upsert_rows", lambda conn, rows: events.append("hotels"))
+    monkeypatch.setattr(google, "upsert_rows", lambda conn, rows: (events.append("hotels"), setattr(google, "LAST_ROWS", rows)))
     monkeypatch.setattr(google.time, "sleep", lambda s: None)
     return events, runs
 
 
-CHUNK = [(1, "Amankila", "Amankila Bali")]
+HOTELS = [(1, "Amankila", "bali")]
 ITEM = {"search_query": "Amankila Bali", "name": "Amankila", "star_rating": 5}
+
+
+def run(items, usages, hotels=HOTELS, cfg=CFG, per_run=None, **kw):
+    events = kw.pop("events")
+    c = FakeClient(items, usages, events=events, **kw)
+    c.per_run = per_run
+    return c, google.process_chunk(c, Conn(events), hotels, cfg)
 
 
 def test_usage_poll_succeeds_after_retries(db):
     events, runs = db
-    c = FakeClient([ITEM], [0.0, 0.0, 0.009], events=events)
-    assert google.process_chunk(c, Conn(events), CHUNK, CFG) == 1
-    assert runs[-1]["usage_usd"] == 0.009
+    _, n = run([ITEM], [0.0, 0.0, 0.009], events=events)
+    assert n == 1 and runs[-1]["usage_usd"] == 0.009
 
 
 def test_items_but_usage_unconfirmed_raises_and_leaves_null(db):
     events, runs = db
     with pytest.raises(RuntimeError, match="usage"):
-        google.process_chunk(FakeClient([ITEM], [0.0], events=events), Conn(events), CHUNK, CFG)
+        run([ITEM], [0.0], events=events)
     assert "usage_usd" not in runs[-1] and "hotels" not in events
 
 
 def test_failed_run_unstamped_records_observed_usage(db):
     events, runs = db
     with pytest.raises(RuntimeError, match="FAILED"):
-        google.process_chunk(FakeClient([], [0.0], status="FAILED", events=events), Conn(events), CHUNK, CFG)
+        run([], [0.0], status="FAILED", events=events)
     assert "hotels" not in events and "finished_at" in runs[-1] and runs[-1]["usage_usd"] == 0.0
 
 
-def test_zero_items_timeout_records_observed_and_aborts(db):
+def test_stage1_zero_items_aborts(db):
     events, runs = db
     with pytest.raises(RuntimeError, match="no items"):
-        google.process_chunk(FakeClient([], [0.0], events=events), Conn(events), CHUNK, CFG)
+        run([], [0.0], events=events)
     assert "hotels" not in events and runs[-1]["usage_usd"] == 0.0 and runs[-1]["item_count"] == 0
 
 
 def test_delete_after_hotels_upsert_and_commit(db):
     events, _ = db
-    google.process_chunk(FakeClient([ITEM], [0.009], events=events), Conn(events), CHUNK, CFG)
+    run([ITEM], [0.009], events=events)
     assert events[-3:] == ["hotels", "commit", "delete"]
 
 
 def test_all_items_unmapped_aborts(db):
     events, _ = db
     with pytest.raises(RuntimeError, match="maps to any query"):
-        google.process_chunk(FakeClient([{"search_query": "zzz", "name": "x"}], [0.003], events=events), Conn(events), CHUNK, CFG)
+        run([{"search_query": "zzz", "name": "x"}], [0.003], events=events)
     assert "hotels" not in events
 
 
-def test_chunk_queries_prefix_empty_and_set():
-    hotels = [(1, "Alila Seminyak", "bali")]
-    assert google.chunk_queries(hotels, CFG) == [(1, "Alila Seminyak", "Alila Seminyak Bali")]
-    cfg = CFG | {"google": CFG["google"] | {"query_prefix": "hotels in "}}
-    assert google.chunk_queries(hotels, cfg)[0][2] == "hotels in Alila Seminyak Bali"
+def test_form_query():
+    g = CFG["google"]
+    assert google.form_query("plain", "Alila Seminyak", "bali", g) == "Alila Seminyak Bali"
+    assert google.form_query("name_only", "Alila Seminyak", "bali", g) == "Alila Seminyak"
+    assert google.form_query("prefixed", "Alila Seminyak", "bali", g) == "hotels in Alila Seminyak Bali"
 
 
-def test_prefix_recorded_in_run_input(db):
+def test_all_hit_at_stage1_one_run(db):
     events, runs = db
-    cfg = CFG | {"google": CFG["google"] | {"query_prefix": "hotels in "}}
-    google.process_chunk(FakeClient([ITEM], [0.009], events=events), Conn(events), CHUNK, cfg)
-    assert runs[0]["input"]["query_prefix"] == "hotels in "
+    c, _ = run([ITEM], [0.009], events=events)
+    assert len(c.inputs) == 1 and runs[0]["input"]["query_form"] == "plain" and len(runs) == 2
+
+
+def test_rescued_at_stage2(db):
+    events, runs = db
+    c, _ = run(None, [0.009], events=events, per_run=[
+        [{"search_query": "Amankila Bali", "name": "Totally Other Place"}],
+        [{"search_query": "Amankila", "name": "Amankila", "star_rating": 5}]])
+    assert len(c.inputs) == 2 and c.inputs[1]["queries"] == ["Amankila"]
+    assert [r["input"]["query_form"] for r in runs if "input" in r] == ["plain", "name_only"]
+    assert google.LAST_ROWS[0]["google_query"] == "Amankila" and google.LAST_ROWS[0]["google_star_rating"] == 5
+
+
+def test_rescued_only_at_stage3_and_zero_item_stage2_is_not_abort(db):
+    events, runs = db
+    c, _ = run(None, [0.009], events=events, per_run=[
+        [{"search_query": "Amankila Bali", "name": "Zzz Qqq"}], [],
+        [{"search_query": "hotels in Amankila Bali", "name": "Amankila", "star_rating": 5}]])
+    assert len(c.inputs) == 3 and google.LAST_ROWS[0]["google_query"] == "hotels in Amankila Bali"
+
+
+def test_never_found_stamped_with_last_query_and_best_kept(db):
+    events, _ = db
+    c, _ = run(None, [0.009], events=events, per_run=[[{"search_query": "Amankila Bali", "name": "Zzz"}], [], []])
+    r = google.LAST_ROWS[0]
+    assert len(c.inputs) == 3 and r["google_name"] is None and r["google_match_score"] < 75
+    assert r["google_scraped_at"] is not None and "hotels" in events
+
+
+def test_uncertain_score_not_retried(db):
+    events, _ = db
+    c, _ = run([{"search_query": "Amankila Bali", "name": "Amankilo"}], [0.009], events=events)
+    assert len(c.inputs) == 1 and 75 <= google.LAST_ROWS[0]["google_match_score"] < 90
+
+
+def test_retry_keeps_best_across_stages(db):
+    events, _ = db
+    run(None, [0.009], events=events, per_run=[
+        [{"search_query": "Amankila Bali", "name": "Amanda"}],
+        [{"search_query": "Amankila", "name": "Zzz"}], [{"search_query": "hotels in Amankila Bali", "name": "Zzz"}]])
+    r = google.LAST_ROWS[0]
+    assert r["google_query"] == "Amankila Bali" and r["google_match_score"] > 0
 
 
 def test_spend_guard_null_usage_and_cap():

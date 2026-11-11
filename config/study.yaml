@@ -9,7 +9,8 @@ ceiling: 30
 eligibility_test_size: 3
 reviews_per_hotel: 300
 google: {top_results: 3, hl: en, gl: id, fetch_details: false, queries_per_run: 50,
-         query_prefix: "", usage_poll_seconds: 3, usage_max_wait_seconds: 60}
+         query_forms: [plain, name_only, prefixed], query_prefix: "hotels in ",
+         usage_poll_seconds: 3, usage_max_wait_seconds: 60}
 name_match: {accept: 90, uncertain: 75}
 batch_size: 10
 concurrency: 1

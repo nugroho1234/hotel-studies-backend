@@ -44,12 +44,19 @@ def _wait_for_usage(client, run, g: dict):
         waited += g["usage_poll_seconds"]
 
 
-def chunk_queries(hotels: list[tuple], cfg: dict) -> list[tuple[int, str, str]]:
-    """hotels = [(hotel_id, hotel_name, destination)] -> [(hotel_id, hotel_name, query)], prefix applied."""
-    return [(h, n, cfg["google"]["query_prefix"] + build_query(n, d)) for h, n, d in hotels]
+def form_query(form: str, name: str, destination: str, g: dict) -> str:
+    """Names of the ladder stages (google.query_forms) -> query text."""
+    if form == "name_only":
+        return name
+    return (g["query_prefix"] if form == "prefixed" else "") + build_query(name, destination)
 
 
-def _search(client, queries: list[str], cfg: dict, conn):
+def is_miss(pick: dict | None, cfg: dict) -> bool:
+    """No result, or best score below name_match.uncertain. 75-89 is not a miss."""
+    return pick is None or pick["google_match_score"] < cfg["name_match"]["uncertain"]
+
+
+def _search(client, queries: list[str], cfg: dict, conn, form: str = "plain", allow_empty: bool = False):
     """Start the run, record provenance, return (items, dataset_id). Raises on failure; never writes usage 0 for an unconfirmed run that returned items."""
     g = cfg["google"]
     run_input = {"queries": queries, "max_results_per_query": g["top_results"], "hl": g["hl"], "gl": g["gl"],
@@ -57,7 +64,7 @@ def _search(client, queries: list[str], cfg: dict, conn):
     run = client.actor(ACTOR).start(run_input=run_input)
     # Provenance first, so an interrupted command can be traced.
     upsert(conn, "scrape_runs", [{"run_id": run.id, "actor": ACTOR, "pass": "google",
-                                  "input": run_input | {"query_prefix": g["query_prefix"]},
+                                  "input": run_input | {"query_form": form, "query_prefix": g["query_prefix"]},
                                   "dataset_id": run.default_dataset_id, "started_at": datetime.now(timezone.utc)}], "run_id")
     conn.commit()
     run = client.run(run.id).wait_for_finish()
@@ -75,29 +82,45 @@ def _search(client, queries: list[str], cfg: dict, conn):
     if not ok:
         raise RuntimeError(f"Apify run {run.id} ended with status {run.status}")
     if not items:
-        raise RuntimeError(f"Apify run {run.id} returned no items; hotels left unstamped (check the actor and queries)")
+        if not allow_empty:
+            raise RuntimeError(f"Apify run {run.id} returned no items; hotels left unstamped (check the actor and queries)")
+        return [], run.default_dataset_id
     if not confirmed:
         raise RuntimeError(f"Apify run {run.id}: usage not confirmed within {g['usage_max_wait_seconds']}s; usage_usd left NULL")
     return items, run.default_dataset_id
 
 
-def process_chunk(client, conn, chunk: list[tuple[int, str, str]], cfg: dict) -> int:
-    """chunk = [(hotel_id, hotel_name, query)]. Stamps hotels only after a successful, mappable run."""
-    items, dataset_id = _search(client, [q for _, _, q in chunk], cfg, conn)
-    by_query = group_results(items)
-    wanted = {q for _, _, q in chunk}
-    unmapped = [it for it in items if it.get("search_query") not in wanted]
-    if len(unmapped) == len(items):
-        raise RuntimeError("No Apify item maps to any query of this chunk; hotels left unstamped")
-    if unmapped:
-        log.warning("%d of %d Apify items did not map to a query", len(unmapped), len(items))
+def process_chunk(client, conn, hotels: list[tuple[int, str, str]], cfg: dict) -> int:
+    """hotels = [(hotel_id, name, destination)]. Runs the query ladder (only misses go on), stamps hotels once at the end."""
+    g = cfg["google"]
+    best = {h: None for h, _, _ in hotels}  # hotel_id -> (pick, query)
+    last_q, datasets = {}, []
+    for stage, form in enumerate(g["query_forms"]):
+        pending = [(h, n, form_query(form, n, d, g)) for h, n, d in hotels
+                   if (best[h] is None or is_miss(best[h][0], cfg)) and form_query(form, n, d, g) != last_q.get(h)]
+        if not pending:
+            continue
+        items, dataset_id = _search(client, [q for _, _, q in pending], cfg, conn, form, allow_empty=stage > 0)
+        datasets.append(dataset_id)
+        by_query = group_results(items)
+        unmapped = [it for it in items if it.get("search_query") not in {q for _, _, q in pending}]
+        if items and len(unmapped) == len(items) and stage == 0:
+            raise RuntimeError("No Apify item maps to any query of this chunk; hotels left unstamped")
+        if unmapped:
+            log.warning("%d of %d Apify items did not map to a query", len(unmapped), len(items))
+        for h, n, q in pending:
+            last_q[h] = q
+            pick = pick_best(n, by_query.get(q, []), cfg["name_match"])
+            if best[h] is None or pick["google_match_score"] > best[h][0]["google_match_score"]:
+                best[h] = (pick, q)
     now = datetime.now(timezone.utc)
-    rows = [{"hotel_id": h, "google_query": q, "google_scraped_at": now,
-             **pick_best(n, by_query.get(q, []), cfg["name_match"])} for h, n, q in chunk]
+    rows = [{"hotel_id": h, "google_query": best[h][1] if best[h][0]["google_match_score"] > 0 else last_q[h],
+             "google_scraped_at": now, **best[h][0]} for h, _, _ in hotels]
     upsert_rows(conn, rows)
     conn.commit()
     if cfg["delete_remote_datasets"]:  # only after the results are safely stored
-        client.dataset(dataset_id).delete()
+        for d in datasets:
+            client.dataset(d).delete()
     return len(rows)
 
 
@@ -121,8 +144,7 @@ def run_google_stars(limit: int | None = None, destination: str | None = None) -
         hotels = conn.execute(sql, args).fetchall()
         for i in range(0, len(hotels), n):
             check_spend(conn, cfg)
-            chunk = chunk_queries(hotels[i:i + n], cfg)
-            done += process_chunk(client, conn, chunk, cfg)
+            done += process_chunk(client, conn, hotels[i:i + n], cfg)
             runs += 1
     return {"hotels": done, "runs": runs}
 
