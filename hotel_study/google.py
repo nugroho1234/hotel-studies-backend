@@ -32,16 +32,16 @@ def check_spend(conn, cfg: dict) -> None:
         raise RuntimeError(f"max_spend_usd {cfg['max_spend_usd']} reached (spent {spent})")
 
 
-def _wait_for_usage(client, run, g: dict):
+def _wait_for_usage(client, run, max_wait: int, poll: int):
     """Apify reports usage 0.0 right after a run ends, so poll until > 0 or the max wait; returns the last observed value."""
     waited = 0
     while True:
         run = client.run(run.id).get()
         u = run.usage_total_usd
-        if (u is not None and u > 0) or waited >= g["usage_max_wait_seconds"]:
+        if (u is not None and u > 0) or waited >= max_wait:
             return run, u
-        time.sleep(g["usage_poll_seconds"])
-        waited += g["usage_poll_seconds"]
+        time.sleep(poll)
+        waited += poll
 
 
 FORMS = {"plain", "name_only", "prefixed"}
@@ -61,7 +61,7 @@ def is_miss(pick: dict | None, cfg: dict) -> bool:
     return pick is None or pick["google_match_score"] < cfg["name_match"]["uncertain"]
 
 
-def _search(client, queries: list[str], cfg: dict, conn, form: str = "plain", allow_empty: bool = False):
+def _search(client, queries: list[str], cfg: dict, conn, form: str = "plain"):
     """Start the run, record provenance, return (items, dataset_id). Raises on failure; never writes usage 0 for an unconfirmed run that returned items."""
     g = cfg["google"]
     run_input = {"queries": queries, "max_results_per_query": g["top_results"], "hl": g["hl"], "gl": g["gl"],
@@ -75,20 +75,21 @@ def _search(client, queries: list[str], cfg: dict, conn, form: str = "plain", al
     run = client.run(run.id).wait_for_finish()
     ok = str(getattr(run.status, "value", run.status)) == "SUCCEEDED"
     items = list(client.dataset(run.default_dataset_id).iterate_items()) if ok else []
-    run, usage = _wait_for_usage(client, run, g)
+    # zero-item runs only get the short wait: their usage is genuinely ~0 and ~1800 runs must stay fast
+    wait = g["usage_max_wait_seconds"] if items else g["usage_zero_item_wait_seconds"]
+    run, usage = _wait_for_usage(client, run, wait, g["usage_poll_seconds"])
     confirmed = usage is not None and usage > 0
     row = {"run_id": run.id, "actor": ACTOR, "finished_at": datetime.now(timezone.utc), "item_count": len(items)}
     if confirmed or (not items and usage is not None):  # zero-item/failed runs may genuinely cost 0
         row["usage_usd"] = usage
-    if not confirmed:
+    if not confirmed and items:
         log.warning("Apify run %s: usage unconfirmed after %ss (observed %s)", run.id, g["usage_max_wait_seconds"], usage)
     upsert(conn, "scrape_runs", [row], "run_id")
     conn.commit()
     if not ok:
         raise RuntimeError(f"Apify run {run.id} ended with status {run.status}")
-    if not items:
-        if not allow_empty:
-            raise RuntimeError(f"Apify run {run.id} returned no items; hotels left unstamped (check the actor and queries)")
+    if not items:  # normal outcome: every hotel of the stage is a miss
+        log.info("Apify run %s (%s) returned no items for %d queries", run.id, form, len(queries))
         return [], run.default_dataset_id
     if not confirmed:
         raise RuntimeError(f"Apify run {run.id}: usage not confirmed within {g['usage_max_wait_seconds']}s; usage_usd left NULL")
@@ -123,7 +124,7 @@ def process_chunk(client, conn, hotels: list[tuple[int, str, str]], cfg: dict) -
             if not pending:
                 continue
             check_spend(conn, cfg)
-            items, dataset_id = _search(client, [q for _, _, q in pending], cfg, conn, form, allow_empty=stage > 0)
+            items, dataset_id = _search(client, [q for _, _, q in pending], cfg, conn, form)
             by_query = group_results(items)
             wanted = {q for _, _, q in pending}
             unmapped = [it for it in items if it.get("search_query") not in wanted]

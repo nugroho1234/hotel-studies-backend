@@ -11,7 +11,7 @@ def test_group_results_by_search_query():
 
 
 CFG = {"google": {"top_results": 3, "hl": "en", "gl": "id", "fetch_details": False, "query_prefix": "hotels in ", "query_forms": ["plain", "name_only", "prefixed"],
-                  "usage_poll_seconds": 1, "usage_max_wait_seconds": 3},
+                  "usage_poll_seconds": 1, "usage_max_wait_seconds": 3, "usage_zero_item_wait_seconds": 1},
        "name_match": {"accept": 90, "uncertain": 75}, "delete_remote_datasets": True, "max_spend_usd": 85}
 
 
@@ -24,7 +24,7 @@ class FakeClient:
     def __init__(self, items, usages, status="SUCCEEDED", events=None):
         # items: one list for every run, or a list of lists via runs=
         self.items, self.usages, self.status, self.events = items, list(usages), status, events if events is not None else []
-        self.inputs = []
+        self.inputs, self.gets = [], 0
 
     per_run = None
 
@@ -49,6 +49,7 @@ class FakeClient:
         return R(self.status, 0.0)
 
     def get(self):
+        self.gets += 1
         return R(self.status, self.usages.pop(0) if len(self.usages) > 1 else self.usages[0])
 
     def dataset(self, _):
@@ -114,11 +115,18 @@ def test_failed_run_unstamped_records_observed_usage(db):
     assert "hotels" not in events and "finished_at" in runs[-1] and runs[-1]["usage_usd"] == 0.0
 
 
-def test_stage1_zero_items_aborts(db):
+def test_stage1_zero_items_goes_to_stage2_without_stamping(db):
     events, runs = db
-    with pytest.raises(RuntimeError, match="no items"):
-        run([], [0.0], events=events)
-    assert "hotels" not in events and runs[-1]["usage_usd"] == 0.0 and runs[-1]["item_count"] == 0
+    c, n = run(None, [0.0, 0.0, 0.009], events=events, per_run=[[], [{"search_query": "Amankila", "name": "Amankila", "star_rating": 5}]])
+    assert len(c.inputs) == 2 and n == 1 and events.count("hotels") == 1
+    assert events.index("hotels") > events.index("spend", events.index("spend") + 1)  # stamped only after stage 2
+    assert runs[1]["usage_usd"] == 0.0 and runs[1]["item_count"] == 0 and ROWS[-1]["google_query"] == "Amankila"
+
+
+def test_zero_item_run_uses_short_usage_wait(db):
+    events, _ = db
+    c, _ = run(None, [0.0], events=events, per_run=[[], [], []])
+    assert c.gets == 3 * 2  # zero-item wait 1s / poll 1s => 2 gets per run, not the 4 of the full wait
 
 
 def test_delete_after_hotels_upsert_and_commit(db):
