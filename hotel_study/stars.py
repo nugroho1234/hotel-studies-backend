@@ -3,6 +3,7 @@ from pathlib import Path
 
 from hotel_study.config import ROOT, load_config
 from hotel_study.db import connect
+from hotel_study.matching import names_equivalent
 
 OUT = ROOT / "output"
 NEEDS_CHECK = ("match_uncertain", "needs_manual_check")
@@ -17,9 +18,11 @@ class OpenManualChecks(Exception):
         super().__init__("finalise-stars refused. " + summary + "\n" + "\n".join(f"  {i}: {r}" for i, r in items))
 
 
-def star_status(google: int | None, ta: int, match_score: float | None, accept_threshold: float) -> tuple[str, int | None]:
-    """PRD §6 table, first match wins. match_score None = no match to doubt (no Google hit, or already resolved)."""
-    if match_score is not None and match_score < accept_threshold:
+def star_status(google: int | None, ta: int, match_score: float | None, accept_threshold: float,
+                partial_name: bool) -> tuple[str, int | None]:
+    """PRD §6 table, first match wins. match_score None = no match to doubt (already resolved);
+    partial_name = Google name is not equivalent to the TripAdvisor name (also true when it is empty)."""
+    if partial_name or (match_score is not None and match_score < accept_threshold):
         return "match_uncertain", None
     if google is None:
         return "google_missing", ta
@@ -27,6 +30,18 @@ def star_status(google: int | None, ta: int, match_score: float | None, accept_t
     if diff == 0:
         return "agree", ta
     return ("needs_manual_check", None) if diff == 1 else ("disagree", None)
+
+
+def _partial(h: dict) -> bool:
+    return not names_equivalent(h["hotel_name"], h["google_name"], h["destination"])
+
+
+def _note(h: dict, accept: float) -> str:
+    if h["star_check_status"] != "match_uncertain":
+        return ""
+    if not h["google_name"]:
+        return "no google hit"
+    return "score below %g" % accept if (h["google_match_score"] or 0) < accept else "partial name match"
 
 
 def _int_cell(s: str) -> int:
@@ -44,7 +59,7 @@ def _resolve(row: dict, uncertain: bool) -> tuple[str, int | None, int | None, f
         raise ValueError(f"match_confirmed must be y or n, got {mc!r}")
     if mc == "n":
         google = _int_cell(cell("manual_google_star")) if cell("manual_google_star") else None
-    status, final = star_status(google, star, None, accept_threshold=0)  # score None: match already resolved, threshold unused
+    status, final = star_status(google, star, None, 0, False)  # score None: match already resolved, threshold unused
     diff = None if google is None else google - star
     ta = None
     if status == "needs_manual_check":
@@ -83,7 +98,7 @@ def plan_finalise(csv_rows: list[dict], hotels: dict[int, dict], all_ids: set[in
     for i, h in hotels.items():
         if not h["google_scraped"]:
             continue
-        status, _ = star_status(h["google_star_rating"], h["star_class"], h["google_match_score"], accept)
+        status, _ = star_status(h["google_star_rating"], h["star_class"], h["google_match_score"], accept, _partial(h))
         if status not in NEEDS_CHECK:
             continue
         if i not in by_id:
@@ -129,7 +144,7 @@ def compare_stars(limit: int | None = None, destination: str | None = None, over
         names = [d.name for d in cur.description]
         for rec in cur.fetchall():
             h = dict(zip(names, rec))
-            status, final = star_status(h["google_star_rating"], h["star_class"], h["google_match_score"], accept)
+            status, final = star_status(h["google_star_rating"], h["star_class"], h["google_match_score"], accept, _partial(h))
             g = h["google_star_rating"]
             diff = None if g is None else g - h["star_class"]
             upd.append({"hotel_id": h["hotel_id"], "star_diff": diff, "star_check_status": status, "final_star_rating": final, "in_sample_frame": final is not None})
@@ -142,9 +157,9 @@ def compare_stars(limit: int | None = None, destination: str | None = None, over
     rows.sort(key=lambda r: (r["star_check_status"] not in NEEDS_CHECK, r["destination"], r["hotel_id"]))
     _write(OUT / "star_comparison.csv", rows, ["hotel_id", "hotel_name", "destination", "star_class", "google_name",
            "google_star_rating", "google_match_score", "star_diff", "star_check_status"])
-    checks = [r | {"match_confirmed": "", "manual_google_star": "", "ta_displayed_class": ""} for r in rows if r["star_check_status"] in NEEDS_CHECK]
+    checks = [r | {"match_note": _note(r, accept), "match_confirmed": "", "manual_google_star": "", "ta_displayed_class": ""} for r in rows if r["star_check_status"] in NEEDS_CHECK]
     _write(OUT / "manual_checks.csv", checks, ["hotel_id", "hotel_name", "destination", "star_class", "google_name", "google_star_rating",
-           "star_diff", "star_check_status", "match_confirmed", "manual_google_star", "ta_displayed_class"])
+           "star_diff", "star_check_status", "match_note", "match_confirmed", "manual_google_star", "ta_displayed_class"])
     counts: dict[str, int] = {}
     for r in rows:
         counts[r["star_check_status"]] = counts.get(r["star_check_status"], 0) + 1

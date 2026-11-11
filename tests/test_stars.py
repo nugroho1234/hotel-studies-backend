@@ -1,22 +1,39 @@
 import pytest
 
 from hotel_study.stars import OpenManualChecks, plan_finalise, resolve_manual, star_status
+from hotel_study.matching import names_equivalent
 
 T = 90
 
 
-@pytest.mark.parametrize("google,ta,score,want", [
-    (None, 4, 80, ("match_uncertain", None)),   # row 1 beats google null
-    (5, 4, 89.9, ("match_uncertain", None)),    # row 1 beats +1
-    (None, 4, 95, ("google_missing", 4)),
-    (None, 4, None, ("google_missing", 4)),     # no Google hit, no score
-    (4, 4, 90, ("agree", 4)),
-    (5, 4, 100, ("needs_manual_check", None)),
-    (3, 4, 100, ("disagree", None)),
-    (6, 4, 100, ("disagree", None)),            # +2
+@pytest.mark.parametrize("google,ta,score,partial,want", [
+    (None, 4, 80, False, ("match_uncertain", None)),   # row 1 beats google null
+    (5, 4, 89.9, False, ("match_uncertain", None)),    # row 1 beats +1
+    (None, 4, 95, False, ("google_missing", 4)),
+    (None, 4, None, False, ("google_missing", 4)),     # no Google hit, no score
+    (4, 4, 90, False, ("agree", 4)),
+    (5, 4, 100, False, ("needs_manual_check", None)),
+    (3, 4, 100, False, ("disagree", None)),
+    (6, 4, 100, False, ("disagree", None)),            # +2
+    (4, 4, 100, True, ("match_uncertain", None)),      # partial name at score 100
+    (None, 4, 100, True, ("match_uncertain", None)),   # partial beats google null
+    (5, 4, 100, True, ("match_uncertain", None)),      # partial beats +1
 ])
-def test_star_status_table(google, ta, score, want):
-    assert star_status(google, ta, score, T) == want
+def test_star_status_table(google, ta, score, partial, want):
+    assert star_status(google, ta, score, T, partial) == want
+
+
+@pytest.mark.parametrize("a,b,dest,want", [
+    ("Hotel Santika Premiere", "Santika Premiere Hotel", "bali", True),
+    ("Arcadia Surabaya Hotel", "Arcadia Hotel", "surabaya", True),          # city appended/omitted
+    ("Alila Seminyak", "Alila Seminyak Bali", "Bali", True),
+    ("Arcadia Surabaya Hotel", "Horison Arcadia Heritage Rajawali Surabaya", "surabaya", False),
+    ("Hotel Santika Premiere Slipi", "Hotel Santika Premiere", "jakarta", False),
+    ("Alila", "", "bali", False),
+    ("Alila", None, "bali", False),
+])
+def test_names_equivalent(a, b, dest, want):
+    assert names_equivalent(a, b, dest) is want
 
 
 def row(**kw):
@@ -61,7 +78,7 @@ def test_uncertain_blank_match_is_open():
 
 
 def hotel(**kw):
-    return dict(star_class=4, google_star_rating=4, google_match_score=100.0, num_reviews_ge_100=True,
+    return dict(hotel_name="Hotel A", google_name="A", destination="bali", star_class=4, google_star_rating=4, google_match_score=100.0, num_reviews_ge_100=True,
                 star_check_status="agree", google_scraped=True) | kw
 
 
@@ -177,3 +194,31 @@ def test_compare_passes_bool_in_sample_frame(tmp_path, monkeypatch):
     got = {p["hotel_id"]: p for p in seen}
     assert got[1]["in_sample_frame"] is False and got[1]["final_star_rating"] is None
     assert got[2]["in_sample_frame"] is True and got[2]["final_star_rating"] == 4
+
+
+def test_plan_finalise_partial_match_needs_check_and_confirmed_y_keeps_google_star():
+    hotels = {1: hotel(hotel_name="Arcadia Surabaya Hotel", google_name="Horison Arcadia Heritage Rajawali Surabaya",
+                       destination="surabaya", google_match_score=100.0, google_star_rating=4, star_check_status="match_uncertain")}
+    with pytest.raises(OpenManualChecks):  # blank match_confirmed is open
+        plan_finalise([dict(hotel_id="1", match_confirmed="")], hotels, set(hotels), T)
+    u = plan_finalise([dict(hotel_id="1", match_confirmed="y")], hotels, set(hotels), T)[0]
+    assert (u["star_check_status"], u["final_star_rating"], u["star_diff"]) == ("agree", 4, 0)
+
+
+def test_finalise_accepts_csv_with_match_note_column(tmp_path):
+    from hotel_study import stars
+    hotels = {1: hotel(google_match_score=80.0, star_check_status="match_uncertain")}
+    p = tmp_path / "m.csv"
+    p.write_text("hotel_id,hotel_name,match_note,match_confirmed,manual_google_star,ta_displayed_class\n1,X,score below 90,y,,\n")
+    import csv
+    rows = list(csv.DictReader(open(p, newline="")))
+    assert plan_finalise(rows, hotels, set(hotels), T)[0]["star_check_status"] == "agree"
+
+
+def test_match_note_reasons():
+    from hotel_study.stars import _note
+    h = dict(star_check_status="match_uncertain", google_name="X", google_match_score=100.0)
+    assert _note(h, 90) == "partial name match"
+    assert _note(h | {"google_match_score": 80.0}, 90) == "score below 90"
+    assert _note(h | {"google_name": None}, 90) == "no google hit"
+    assert _note(h | {"star_check_status": "needs_manual_check"}, 90) == ""

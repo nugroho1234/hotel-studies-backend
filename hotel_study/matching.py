@@ -15,6 +15,14 @@ def match_score(a: str, b: str) -> float:
     return fuzz.token_set_ratio(normalise_name(a), normalise_name(b))
 
 
+def names_equivalent(hotel_name: str, google_name: str | None, destination: str) -> bool:
+    """Same normalised token SET after dropping the destination's words (Google often appends the city)."""
+    if not google_name:
+        return False
+    skip = set(normalise_name(destination).split())
+    return set(normalise_name(hotel_name).split()) - skip == set(normalise_name(google_name).split()) - skip
+
+
 def classify_match(score: float, cfg: dict) -> str:
     """cfg is config name_match: {accept, uncertain}."""
     return "matched" if score >= cfg["accept"] else "uncertain" if score >= cfg["uncertain"] else "none"
