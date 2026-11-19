@@ -15,6 +15,7 @@ name_match: {accept: 90, uncertain: 75}
 review_locale: id       # TripAdvisor domain for reviews; without it Indonesian reviews come back as English MACHINE translations
 batch_size: 10
 concurrency: 1
+target_raw_reviews_per_hotel: 600   # PRD: about 600 raw reviews per hotel; used only to suggest end_page
 end_page: null          # set by hand after the eligibility test
 max_spend_usd: 85
 delete_remote_datasets: true
