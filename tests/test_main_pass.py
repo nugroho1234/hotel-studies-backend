@@ -20,18 +20,21 @@ class World:
 
     def run_batch(self, client, conn, batch, cfg, pass_, end_page):
         ids = [b[0] for b in batch]
+        assert len(self.calls) < 30, "runaway loop"
         if self.spend_after is not None and len(self.calls) >= self.spend_after:
             raise SpendLimitReached("max_spend_usd 85 reached (spent 85)")
         self.calls.append((ids, pass_, end_page))
+        n_set = 0
         for i in ids:
             if self.zero.get(i, 0) > 0:
                 self.zero[i] -= 1
                 continue
+            n_set += 1
             assert self.h[i]["status"] in ("not_scraped", "needs_pass2")
             n = self.truth[i][0 if end_page else 1]
             st, el = reviews.hotel_status(n, 41 if self.truth[i][0] != self.truth[i][1] else 0, end_page, 300, 100)
             self.h[i].update(status=st, elig=el)
-        return len(ids)
+        return n_set  # like the real run_batch: hotels updated
 
 
 class Conn:
@@ -231,12 +234,35 @@ def test_undecided_no_items_raises_once(monkeypatch):
     assert all(h["status"] != "not_needed" for h in w.h.values())
 
 
-def test_zero_review_hotel_two_attempts_then_complete(monkeypatch):
+SQL_HINT = "update hotels set scrape_status='complete', n_raw_reviews=0, n_out_of_window=0, n_other_language=0, n_eligible_reviews=0, is_eligible=false, in_final_sample=false where hotel_id = "
+
+
+def test_zero_review_hotel_marked_when_batch_mates_returned(monkeypatch):
     w = _world({i: E for i in range(1, 8)}, monkeypatch)
     w.zero = {1: 99}
     reviews.scrape_cell(None, Conn(w), CELL, CFG)
+    assert sum(1 for c in w.calls if 1 in c[0]) == 2  # first attempt + one retry
     assert w.h[1]["status"] == "complete" and w.h[1]["elig"] is False and w.h[1]["zeroed"] and not w.h[1]["final"]
-    assert sum(bool(h["final"]) for h in w.h.values()) == 3
+    assert sum(bool(h["final"]) for h in w.h.values()) == 3  # cell continued / finalised
+
+
+def test_whole_batch_empty_raises_and_marks_nothing(monkeypatch):
+    w = _world({i: E for i in range(1, 8)}, monkeypatch)
+    w.zero = {1: 99, 2: 99, 3: 99}
+    with pytest.raises(RuntimeError, match=r"\[1, 2, 3\].*ambiguous"):
+        reviews.scrape_cell(None, Conn(w), CELL, CFG)
+    assert not any(h.get("zeroed") for h in w.h.values()) and all(h["status"] == "not_scraped" for h in w.h.values())
+
+
+def test_single_hotel_batch_empty_twice_raises_with_sql(monkeypatch):
+    cfg = CFG | {"batch_size": 1}
+    w = _world({1: E, 2: E}, monkeypatch)
+    w.zero = {1: 99}
+    with pytest.raises(RuntimeError) as e:
+        reviews.scrape_cell(None, Conn(w), CELL, cfg)
+    assert SQL_HINT + "1" in str(e.value) and "ambiguous" in str(e.value)
+    assert not w.h[1].get("zeroed") and w.h[1]["status"] == "not_scraped"
+    assert sum(1 for c in w.calls if 1 in c[0]) == 2
 
 
 def test_zero_then_reviews_on_retry(monkeypatch):
@@ -287,6 +313,7 @@ def test_failing_cell_does_not_block_others(monkeypatch):
 
 
 def test_spend_limit_stops_all_cells(monkeypatch):
+    # guards the except-clause order in scrape_reviews: SpendLimitReached is a RuntimeError and must not be collected per cell
     seen, c = _entry(monkeypatch, [("Bali", 3), ("Bali", 4), ("Bali", 5)], spend=[("Bali", 4)])
     with pytest.raises(SpendLimitReached):
         reviews.scrape_reviews("1", False, conn=c)
@@ -294,7 +321,11 @@ def test_spend_limit_stops_all_cells(monkeypatch):
 
 
 def test_pass_must_be_1_or_2(monkeypatch):
+    def live(*a, **k): raise AssertionError("touched a live service")
     monkeypatch.setattr(reviews, "load_config", lambda: CFG)
+    monkeypatch.setattr(reviews, "ApifyClient", live)
+    monkeypatch.setattr(reviews, "get_secret", live)
+    monkeypatch.setattr("hotel_study.db.connect", live)
     with pytest.raises(RuntimeError, match="--pass"):
         reviews.scrape_reviews("3", False)
 
@@ -310,3 +341,20 @@ def test_pass2_guard_query_scoped(monkeypatch):
     with pytest.raises(RuntimeError, match="pass 1"):
         reviews.scrape_pass2(None, c, CFG, destination="Bali")
     assert c.args[0] == ["Bali"] and "is_eligible IS NULL" in c.last
+
+
+def test_update_hotels_writes_final_sample_only_for_eligibility_test(monkeypatch):
+    seen = []
+
+    class C:
+        def execute(self, sql, args=()): seen.append((" ".join(sql.split()), args)); return self
+        def commit(self): pass
+    monkeypatch.setattr(reviews, "ingest_items", lambda *a: {1: dict(n_raw=150, n_out_of_window=0, n_other_language=0, n_eligible=150, n_bad_date=0)})
+    reviews._update_hotels(C(), "run", [item(1, 1)], [1], CFG, 41)
+    sql, args = seen[0]
+    assert "in_final_sample = CASE WHEN in_eligibility_test THEN %s ELSE in_final_sample END" in sql
+    assert args[-2] is True and args[-1] == 1  # main-pass run: the value only lands on eligibility-test rows (SQL), others untouched
+
+
+def item(rid, hid, page=1):
+    return {"id": rid, "location": {"locationId": hid}, "inputSource": {"pageNumber": page}}

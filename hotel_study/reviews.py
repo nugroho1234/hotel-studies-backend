@@ -234,12 +234,17 @@ def _run(client, conn, cell, rows, pass_, end_page, cfg) -> None:
         if n is None:
             raise RuntimeError(f"cell {cell}: run failed for hotels {[r[0] for r in rs]}; rerun scrape-reviews --pass 1 to retry")
         now = {r[0]: r for r in _cell_rows(conn, cell)}  # one query per attempt
-        return [r[0] for r in rs if now[r[0]][2] == "not_scraped" or (pass_ == "2" and now[r[0]][2] == "needs_pass2" and now[r[0]][3] is None)]
-    left = attempt(rows)
+        return n, [r[0] for r in rs if now[r[0]][2] == "not_scraped" or (pass_ == "2" and now[r[0]][2] == "needs_pass2" and now[r[0]][3] is None)]
+    n1, left = attempt(rows)
     if left and pass_ == "2":  # pass 1 had ~end_page pages for these, so zero now is a scraper failure; keep their counts, one attempt per rerun
         raise RuntimeError(f"cell {cell}: undecided hotels {left} returned no reviews in the no-endPage re-scrape; check them manually, then rerun")
     if left:  # retry once; still nothing means genuinely no reviews since the window start
-        left = attempt([r for r in rows if r[0] in left])
+        _, left = attempt([r for r in rows if r[0] in left])
+        if left and (n1 == 0 or len(rows) == 1):  # nothing else in the run returned anything: scraper failure vs real zero is ambiguous
+            raise RuntimeError(f"cell {cell}: hotels {left} returned no reviews twice, but the run returned nothing for the rest of its batch "
+                               "(whole-batch or single-hotel empty result), so it is ambiguous (scraper failure vs real zero). Check on TripAdvisor; "
+                               "to mark one ineligible by hand: update hotels set scrape_status='complete', n_raw_reviews=0, n_out_of_window=0, "
+                               "n_other_language=0, n_eligible_reviews=0, is_eligible=false, in_final_sample=false where hotel_id = " + str(left[0]) + (f" (repeat for each of {left})" if len(left) > 1 else ""))
         if left:
             log.error("hotels %s returned no reviews twice; recorded as complete, not eligible, 0 reviews", left)
             conn.execute("UPDATE hotels SET scrape_status = 'complete', n_raw_reviews = 0, n_out_of_window = 0, n_other_language = 0, "
