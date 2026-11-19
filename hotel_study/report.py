@@ -9,7 +9,7 @@ from hotel_study.db import connect
 # Counts only: the registration says the eligibility test examines counts, never review content or ratings.
 SQL = {
     "hotels": "SELECT hotel_id, destination, final_star_rating, n_raw_reviews, n_out_of_window, n_other_language, "
-              "n_eligible_reviews, is_eligible FROM hotels WHERE in_eligibility_test",
+              "n_eligible_reviews, is_eligible FROM hotels WHERE in_eligibility_test ORDER BY hotel_id",
     "pages": "SELECT r.hotel_id, MAX(r.input_page_number) AS pages FROM reviews r "
              "JOIN hotels h USING (hotel_id) WHERE h.in_eligibility_test GROUP BY r.hotel_id",
     "prescreened": "SELECT destination, final_star_rating, COUNT(*) AS prescreened FROM hotels "
@@ -50,17 +50,24 @@ def eligibility_summary(df: pd.DataFrame, prescreened: pd.DataFrame, ceiling: in
     return pd.DataFrame(rows)
 
 
-def eligibility_metrics(df: pd.DataFrame) -> dict:
-    """reviews_per_page: median raw/pages over hotels with pages > 0; shares pooled over all test hotels."""
-    ok = df[df["pages"].fillna(0) > 0]
+def eligibility_metrics(df: pd.DataFrame, min_pages: int = 10) -> dict:
+    """reviews_per_page: pooled sum(raw)/sum(pages) over hotels with pages >= min_pages (small hotels end on a
+    partial page and bias a per-hotel median low). Shares are pooled over all test hotels."""
+    big = df[df["pages"].fillna(0) >= min_pages]
+    rate = big.n_raw_reviews.sum() / big.pages.sum() if len(big) else math.nan
     raw, out, el = df.n_raw_reviews.sum(), df.n_out_of_window.sum(), df.n_eligible_reviews.sum()
-    return {"reviews_per_page": (ok.n_raw_reviews / ok.pages).median() if len(ok) else math.nan,
+    return {"reviews_per_page": rate, "n_rate_hotels": len(big),
+            "rate_max": (big.n_raw_reviews / big.pages).max() if len(big) else math.nan,
+            "rate_median": (big.n_raw_reviews / big.pages).median() if len(big) else math.nan,
             "in_window_share": (raw - out) / raw if raw else math.nan,
             "en_id_share": el / (raw - out) if raw - out else math.nan}
 
 
-def report_eligibility_test(limit: int | None = None, destination: str | None = None, conn=None) -> str:
+def report_eligibility_test(limit: int | None = None, destination: str | None = None, conn=None, out_dir=None) -> str:
     cfg = load_config()
+    for k in ("ceiling", "rate_min_pages", "target_raw_reviews_per_hotel", "max_spend_usd"):
+        if cfg.get(k) is None:
+            raise RuntimeError(f"{k} is not set in config/study.yaml")
     own = conn is None
     conn = conn or connect()
     try:
@@ -72,6 +79,7 @@ def report_eligibility_test(limit: int | None = None, destination: str | None = 
         if own:
             conn.close()
     hotels = hotels[hotels.n_raw_reviews.notna()]  # not yet scraped: not a result
+    n_scraped = len(hotels)  # spend covers all of them, whatever --destination/--limit say
     hotels = hotels[hotels.destination.map(lambda d: same_destination(d, destination))]
     pre = pre[pre.destination.map(lambda d: same_destination(d, destination))]
     if limit:
@@ -80,18 +88,21 @@ def report_eligibility_test(limit: int | None = None, destination: str | None = 
     if df.empty:
         return "No eligibility-test hotels with results yet."
     summary = eligibility_summary(df, pre, cfg["ceiling"])
-    m = eligibility_metrics(df)
-    out = ROOT / "output" / "eligibility_report.csv"
+    m = eligibility_metrics(df, cfg["rate_min_pages"])
+    out = (out_dir or ROOT / "output") / "eligibility_report.csv"
     out.parent.mkdir(exist_ok=True)
     summary.to_csv(out, index=False)
     test = spend[spend["pass"] == "eligibility_test"]
     usd, runs = float(test.usd.sum()), int(test.runs.sum())
     lines = [summary.round(3).to_string(index=False), "",
-             f"reviews per page (median): {m['reviews_per_page']:.1f}",
+             f"reviews per page (pooled, hotels with >= {cfg['rate_min_pages']} pages): {m['reviews_per_page']:.1f} "
+             f"({m['n_rate_hotels']} hotels; per-hotel max {m['rate_max']:.1f}, median {m['rate_median']:.1f})",
              f"in-window share of raw reviews: {m['in_window_share']:.3f}",
              f"EN/ID share of in-window reviews: {m['en_id_share']:.3f}",
-             f"eligibility-test spend: ${usd:.2f} over {runs} runs, ${usd / len(df):.2f} per hotel",
+             f"eligibility-test spend: ${usd:.2f} over {runs} runs, ${usd / n_scraped:.2f} per scraped test hotel ({n_scraped} hotels, unfiltered)",
              f"total spend all passes: ${float(spend.usd.sum()):.2f} of max_spend_usd {cfg['max_spend_usd']}"]
+    if m["n_rate_hotels"] < 3:
+        lines.append(f"WARNING: only {m['n_rate_hotels']} hotels qualify for the rate (need 3); estimate unreliable, do not set end_page from it")
     if not math.isnan(m["reviews_per_page"]):
         lines.append(f"SUGGESTION only (set end_page in config by hand): "
                      f"{suggest_end_page(m['reviews_per_page'], cfg['target_raw_reviews_per_hotel'])} "

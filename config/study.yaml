@@ -16,6 +16,7 @@ review_locale: id       # TripAdvisor domain for reviews; without it Indonesian 
 batch_size: 10
 concurrency: 1
 target_raw_reviews_per_hotel: 600   # PRD: about 600 raw reviews per hotel; used only to suggest end_page
+rate_min_pages: 10   # only hotels with at least this many pages enter the reviews-per-page estimate
 end_page: null          # set by hand after the eligibility test
 max_spend_usd: 85
 delete_remote_datasets: true
