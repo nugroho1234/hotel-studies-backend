@@ -104,3 +104,16 @@ def select_reviews_cmd(limit: Limit = None, destination: Destination = None) -> 
     from hotel_study.selection import select_reviews
 
     typer.echo(select_reviews(limit, destination))
+
+
+@app.command("pilot-sample")
+def pilot_sample_cmd(force: Annotated[bool, typer.Option("--force", help="Redraw even if a pilot sample exists")] = False,
+                     limit: Limit = None, destination: Destination = None) -> None:
+    """Draw the stratified pilot sample from selected reviews and export output/pilot_100.csv."""
+    from hotel_study.pilot import pilot_sample
+
+    try:
+        typer.echo(pilot_sample(force, limit, destination))
+    except RuntimeError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(1)
