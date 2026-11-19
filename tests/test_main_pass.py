@@ -13,7 +13,7 @@ class World:
     """In-memory hotels + a fake run_batch. `truth[h]` = (eligible_after_pass1, eligible_after_no_endpage)."""
 
     def __init__(self, truth, tested=(), cell=CELL):
-        self.truth, self.calls, self.spend_after = truth, [], None
+        self.truth, self.calls, self.spend_after, self.zero = truth, [], None, {}  # zero[h] = attempts returning no items
         self.h = {i: dict(status="not_scraped", elig=None, test=False, final=None, url=f"u{i}") for i in truth}  # keys ARE cell_order
         for i in tested:
             self.h[i].update(status="complete", elig=truth[i][1] >= 100, test=True)
@@ -24,6 +24,9 @@ class World:
             raise SpendLimitReached("max_spend_usd 85 reached (spent 85)")
         self.calls.append((ids, pass_, end_page))
         for i in ids:
+            if self.zero.get(i, 0) > 0:
+                self.zero[i] -= 1
+                continue
             assert self.h[i]["status"] in ("not_scraped", "needs_pass2")
             n = self.truth[i][0 if end_page else 1]
             st, el = reviews.hotel_status(n, 41 if self.truth[i][0] != self.truth[i][1] else 0, end_page, 300, 100)
@@ -40,6 +43,9 @@ class Conn:
             for h in self.w.h.values():
                 if h["status"] == "not_scraped":
                     h["status"] = "not_needed"
+        elif self.last.startswith("UPDATE hotels SET scrape_status = 'complete'"):
+            for i in self.args[0]:
+                self.w.h[i].update(status="complete", elig=False, zeroed=True)
         elif self.last.startswith("UPDATE hotels SET in_final_sample"):
             for i, h in self.w.h.items():
                 h["final"] = i in self.args[0]
@@ -164,7 +170,7 @@ def test_rerun_after_crash_skips_scraped(monkeypatch):
 def test_failed_run_stalls_cell(monkeypatch):
     w = World({i: E for i in range(1, 5)})
     monkeypatch.setattr(reviews, "run_batch", lambda *a: None)
-    with pytest.raises(RuntimeError, match="not scraped"):
+    with pytest.raises(RuntimeError, match="failed"):
         reviews.scrape_cell(None, Conn(w), CELL, CFG)
     assert all(h["status"] == "not_scraped" for h in w.h.values())
 
@@ -178,10 +184,12 @@ def test_main_pass_requires_end_page(monkeypatch):
 # ---- pass 2 ----
 class P2Conn:
     def __init__(self, rows, unfinished=0): self.rows, self.unfinished, self.last = rows, unfinished, ""
-    def execute(self, sql, args=()): self.last = " ".join(sql.split()); return self
+    def execute(self, sql, args=()): self.last = " ".join(sql.split()); self.args = args; return self
     def commit(self): pass
     def fetchone(self): return (0,) if "scrape_runs" in self.last else ((1,) if self.unfinished else None)
     def fetchall(self):
+        if "DISTINCT destination" in self.last:
+            return [("Bali",), ("Jakarta",)]
         assert "in_final_sample" in self.last and "needs_pass2" in self.last
         return self.rows
 
@@ -198,3 +206,107 @@ def test_pass2_refuses_unfinished_cells(monkeypatch):
     monkeypatch.setattr(reviews, "run_batch", lambda *a: pytest.fail("ran"))
     with pytest.raises(RuntimeError, match="pass 1"):
         reviews.scrape_pass2(None, P2Conn([], unfinished=1), CFG)
+
+
+# ---- fix round 1 ----
+def _world(truth, monkeypatch, **kw):
+    w = World(truth, **kw)
+    monkeypatch.setattr(reviews, "run_batch", w.run_batch)
+    return w
+
+
+def test_undecided_no_items_raises_once(monkeypatch):
+    w = _world({1: (80, 120), 2: E, 3: E, 4: E}, monkeypatch)
+    orig = w.run_batch
+
+    def rb(client, conn, batch, cfg, pass_, end_page):
+        if pass_ == "2":
+            w.zero[1] = 1  # the no-endPage run returns nothing for hotel 1
+        return orig(client, conn, batch, cfg, pass_, end_page)
+    monkeypatch.setattr(reviews, "run_batch", rb)
+    with pytest.raises(RuntimeError, match=r"\[1\].*manually"):
+        reviews.scrape_cell(None, Conn(w), CELL, CFG)
+    assert [c for c in w.calls if c[1] == "2"] == [([1], "2", None)]  # exactly one pass-2 attempt
+    assert w.h[1]["status"] == "needs_pass2" and w.h[1]["elig"] is None
+    assert all(h["status"] != "not_needed" for h in w.h.values())
+
+
+def test_zero_review_hotel_two_attempts_then_complete(monkeypatch):
+    w = _world({i: E for i in range(1, 8)}, monkeypatch)
+    w.zero = {1: 99}
+    reviews.scrape_cell(None, Conn(w), CELL, CFG)
+    assert w.h[1]["status"] == "complete" and w.h[1]["elig"] is False and w.h[1]["zeroed"] and not w.h[1]["final"]
+    assert sum(bool(h["final"]) for h in w.h.values()) == 3
+
+
+def test_zero_then_reviews_on_retry(monkeypatch):
+    w = _world({i: E for i in range(1, 8)}, monkeypatch)
+    w.zero = {2: 1}
+    reviews.scrape_cell(None, Conn(w), CELL, CFG)
+    assert w.h[2]["elig"] is True and not w.h[2].get("zeroed") and w.h[2]["final"]
+
+
+def test_undecided_after_ceiling_not_rescraped(monkeypatch):
+    # 1,2,3 eligible fill the ceiling; hotel 4 is undecided but ordered after the 3rd eligible
+    w = _world({i: E for i in range(1, 6)}, monkeypatch, tested=(1, 2, 3))
+    w.h[4].update(status="needs_pass2", elig=None)
+    reviews.scrape_cell(None, Conn(w), CELL, CFG)
+    assert w.calls == [] and w.h[4]["status"] == "needs_pass2"
+    w2 = _world({1: E, 2: E, 3: E, 4: E}, monkeypatch, tested=(2, 3, 4))
+    w2.h[1].update(status="needs_pass2", elig=None)
+    w2.truth[1] = (80, 120)
+    reviews.scrape_cell(None, Conn(w2), CELL, CFG)
+    assert w2.calls == [([1], "2", None)]  # ordered before the ceiling-th eligible: must be resolved
+
+
+def _entry(monkeypatch, cells, fail=(), spend=()):
+    class C:
+        def execute(self, sql, args=()): self.sql = sql; return self
+        def fetchall(self): return cells
+        def close(self): pass
+    monkeypatch.setattr(reviews, "ApifyClient", lambda t: None)
+    monkeypatch.setattr(reviews, "get_secret", lambda n: "x")
+    monkeypatch.setattr(reviews, "load_config", lambda: CFG)
+    monkeypatch.setattr(reviews, "reconcile", lambda *a: 0)
+    seen = []
+
+    def sc(client, conn, cell, cfg):
+        seen.append(cell)
+        if cell in fail: raise RuntimeError("stalled")
+        if cell in spend: raise SpendLimitReached("max_spend_usd")
+        return 3
+    monkeypatch.setattr(reviews, "scrape_cell", sc)
+    return seen, C()
+
+
+def test_failing_cell_does_not_block_others(monkeypatch):
+    seen, c = _entry(monkeypatch, [("Bali", 3), ("Bali", 4), ("Bali", 5)], fail=[("Bali", 3)])
+    with pytest.raises(RuntimeError, match=r"2 cells finished.*1 failed"):
+        reviews.scrape_reviews("1", False, conn=c)
+    assert seen == [("Bali", 3), ("Bali", 4), ("Bali", 5)]
+
+
+def test_spend_limit_stops_all_cells(monkeypatch):
+    seen, c = _entry(monkeypatch, [("Bali", 3), ("Bali", 4), ("Bali", 5)], spend=[("Bali", 4)])
+    with pytest.raises(SpendLimitReached):
+        reviews.scrape_reviews("1", False, conn=c)
+    assert seen == [("Bali", 3), ("Bali", 4)]
+
+
+def test_pass_must_be_1_or_2(monkeypatch):
+    monkeypatch.setattr(reviews, "load_config", lambda: CFG)
+    with pytest.raises(RuntimeError, match="--pass"):
+        reviews.scrape_reviews("3", False)
+
+
+def test_pass2_reports_partial_failures(monkeypatch):
+    monkeypatch.setattr(reviews, "run_batch", lambda c, conn, b, cfg, p, e: len(b) - 1)
+    out = reviews.scrape_pass2(None, P2Conn([(1, "Bali", 4, "u1"), (2, "Bali", 4, "u2")]), CFG)
+    assert "1 hotels scraped, 1 failed" in out
+
+
+def test_pass2_guard_query_scoped(monkeypatch):
+    c = P2Conn([], unfinished=1)
+    with pytest.raises(RuntimeError, match="pass 1"):
+        reviews.scrape_pass2(None, c, CFG, destination="Bali")
+    assert c.args[0] == ["Bali"] and "is_eligible IS NULL" in c.last
