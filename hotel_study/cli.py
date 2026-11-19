@@ -82,3 +82,17 @@ def order_cells_cmd(limit: Annotated[int | None, typer.Option("--limit", help="O
     except RuntimeError as e:
         typer.echo(str(e), err=True)
         raise typer.Exit(1)
+
+
+@app.command("scrape-reviews")
+def scrape_reviews_cmd(pass_: Annotated[int, typer.Option("--pass", help="1 or 2")] = 1,
+                       eligibility_test: Annotated[bool, typer.Option("--eligibility-test", help="Scrape only the first hotels of each cell, no page cap")] = False,
+                       limit: Limit = None, destination: Destination = None) -> None:
+    """Scrape TripAdvisor reviews (resumable; reruns never duplicate reviews)."""
+    from hotel_study.reviews import scrape_reviews
+
+    try:
+        typer.echo(scrape_reviews(str(pass_), eligibility_test, limit, destination))
+    except (RuntimeError, NotImplementedError) as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(1)
