@@ -14,6 +14,12 @@ SQL = {
              "JOIN hotels h USING (hotel_id) WHERE h.in_eligibility_test GROUP BY r.hotel_id",
     "prescreened": "SELECT destination, final_star_rating, COUNT(*) AS prescreened FROM hotels "
                    "WHERE cell_order IS NOT NULL GROUP BY destination, final_star_rating",
+    # funnel: counts and status flags only, no review content, ratings or reviewer columns
+    "funnel_hotels": "SELECT hotel_id, destination, star_class, num_reviews_ge_100, star_check_status, in_sample_frame, "
+                     "final_star_rating, scrape_status, is_eligible, in_final_sample, n_raw_reviews, n_out_of_window, "
+                     "n_other_language, n_eligible_reviews FROM hotels ORDER BY hotel_id",
+    "review_counts": "SELECT hotel_id, COUNT(*) AS n_reviews, COUNT(*) FILTER (WHERE is_selected) AS n_selected "
+                     "FROM reviews GROUP BY hotel_id",
     "spend": "SELECT pass, COUNT(*) AS runs, COALESCE(SUM(usage_usd), 0) AS usd FROM scrape_runs GROUP BY pass",
 }
 
@@ -108,3 +114,99 @@ def report_eligibility_test(limit: int | None = None, destination: str | None = 
                      f"{suggest_end_page(m['reviews_per_page'], cfg['target_raw_reviews_per_hotel'])} "
                      f"for ~{cfg['target_raw_reviews_per_hotel']} raw reviews per hotel")
     return "\n".join(lines) + f"\n\nWrote {out}"
+
+
+STATUSES = ["agree", "agree_half_star", "disagree", "google_missing", "needs_manual_check", "match_uncertain", "unchecked"]
+
+
+def _b(s: pd.Series) -> pd.Series:
+    return s.fillna(False).astype(bool)
+
+
+def funnel(hotels: pd.DataFrame, selected_counts) -> pd.DataFrame:
+    """PRD 12 funnel per destination x star class plus an ALL/ALL total. The star basis is in each column name:
+    stages up to '>= 100 reviews' use star_class (TripAdvisor), later ones final_star_rating (NULL = disagreeing
+    classes, so those hotels drop at the star check). Hotel stages are non-increasing; the last column counts reviews."""
+    h = hotels.copy()
+    h["selected"] = h.hotel_id.map(pd.Series(selected_counts, dtype="float64")).fillna(0)
+    scraped = ~h.scrape_status.isin(["not_scraped", "not_needed"])
+    st, fin = "star_class", "final_star_rating"
+    ge, fr, el, fs = _b(h.num_reviews_ge_100), _b(h.in_sample_frame), _b(h.is_eligible), _b(h.in_final_sample)
+    stages = [("1_hotels_listed (star_class)", st, h.hotel_id.notna()), ("2_reviews_ge_100 (star_class)", st, ge),
+              ("3_star_classes_agree (final_star_rating)", fin, fr), ("4_scraped (final_star_rating)", fin, fr & scraped),
+              ("5_eligible (final_star_rating)", fin, el), ("6_in_final_sample (final_star_rating)", fin, fs)]
+    stages += [(f"status_{k} (star_class)", st, ge & (h.star_check_status.fillna("unchecked") == k)) for k in STATUSES]
+    cols = {}
+    for name, basis, mask in stages:
+        g = h[mask & h[basis].notna()]
+        cols[name] = g.groupby([g.destination, g[basis].astype(int).astype(str)]).size()
+    g = h[h[fin].notna()]
+    cols["7_reviews_selected (final_star_rating)"] = g.groupby([g.destination, g[fin].astype(int).astype(str)]).selected.sum()
+    out = pd.DataFrame(cols).fillna(0).astype(int)
+    out.index.names = ["destination", "star_class"]
+    out = out.sort_index().reset_index()
+    total = {"destination": "ALL", "star_class": "ALL", **out.drop(columns=["destination", "star_class"]).sum().to_dict()}
+    return pd.concat([out, pd.DataFrame([total])], ignore_index=True)
+
+
+def acceptance_checks(hotels: pd.DataFrame, selected_counts, review_counts, ceiling: int, max_selected: int) -> list:
+    """PRD 12 sum-checks as (name, ok, detail); counts only."""
+    fin = hotels[_b(hotels.in_final_sample)]
+    cells = fin.groupby(["destination", "final_star_rating"]).size()
+    over_cell = cells[cells > ceiling]
+    sel = pd.Series(selected_counts, dtype="float64")
+    over_sel = sel[sel > max_selected]
+    rev = pd.Series(review_counts, dtype="float64")
+    ids = hotels.loc[hotels.scrape_status == "not_needed", "hotel_id"]
+    bad = int((ids.map(rev).fillna(0) > 0).sum())
+    return [("cell ceiling", over_cell.empty, f"{len(over_cell)} cells above {ceiling} final-sample hotels"),
+            ("selected per hotel", over_sel.empty, f"{len(over_sel)} hotels above {max_selected} selected reviews"),
+            ("not_needed without reviews", bad == 0, f"{bad} not_needed hotels have reviews")]
+
+
+def write_funnel_csv(f: pd.DataFrame, out_dir=None):
+    out = (out_dir or ROOT / "output") / "funnel.csv"
+    out.parent.mkdir(exist_ok=True)
+    f.to_csv(out, index=False)
+    return out
+
+
+def write_review_counts(hotels: pd.DataFrame, selected_counts, out_dir=None):
+    h = hotels[_b(hotels.in_final_sample)].copy()
+    h["n_selected"] = h.hotel_id.map(pd.Series(selected_counts, dtype="float64")).fillna(0).astype(int)
+    cols = ["hotel_id", "destination", "final_star_rating", "n_raw_reviews", "n_out_of_window", "n_other_language",
+            "n_eligible_reviews", "n_selected"]
+    out = (out_dir or ROOT / "output") / "review_counts_by_hotel.csv"
+    out.parent.mkdir(exist_ok=True)
+    h[cols].to_csv(out, index=False)
+    return out
+
+
+def report_funnel(limit: int | None = None, destination: str | None = None, conn=None, out_dir=None) -> str:
+    cfg = load_config()
+    for k in ("ceiling", "reviews_per_hotel"):
+        if cfg.get(k) is None:
+            raise RuntimeError(f"{k} is not set in config/study.yaml")
+    own = conn is None
+    conn = conn or connect()
+    try:
+        def q(k):
+            cur = conn.execute(SQL[k])
+            return pd.DataFrame(cur.fetchall(), columns=[c.name for c in cur.description])
+        hotels, rev = q("funnel_hotels"), q("review_counts")
+    finally:
+        if own:
+            conn.close()
+    hotels = hotels[hotels.destination.map(lambda d: same_destination(d, destination))]
+    if limit:
+        hotels = hotels.head(limit)
+    sel, n_rev = rev.set_index("hotel_id").n_selected, rev.set_index("hotel_id").n_reviews
+    f = funnel(hotels, sel)
+    p1, p2 = write_funnel_csv(f, out_dir), write_review_counts(hotels, sel, out_dir)
+    lines = [f.to_string(index=False), "",
+             "star_basis: each column name gives its basis; star_class = TripAdvisor class (stages before the star "
+             "check), final_star_rating = verified class (NULL when classes disagree, so those hotels drop at stage 3). "
+             "Stage 7 counts reviews, not hotels."]
+    lines += [f"{'PASS' if ok else 'FAIL'}: {n} ({d})"
+              for n, ok, d in acceptance_checks(hotels, sel, n_rev, cfg["ceiling"], cfg["reviews_per_hotel"])]
+    return "\n".join(lines) + f"\n\nWrote {p1} and {p2}"

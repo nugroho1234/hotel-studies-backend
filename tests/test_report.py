@@ -100,6 +100,83 @@ class FakeConn:
         return self.data[next(k for k, v in report.SQL.items() if v == q)]
 
 
+FCOLS = ["hotel_id", "destination", "star_class", "num_reviews_ge_100", "star_check_status", "in_sample_frame",
+         "final_star_rating", "scrape_status", "is_eligible", "in_final_sample", "n_raw_reviews", "n_out_of_window",
+         "n_other_language", "n_eligible_reviews"]
+# 6 hotels: 1 final sample; 2 scraped, ineligible; 3 scraped (needs_pass2); 4 not_needed; 5 half-star agree, <100 reviews
+# excluded earlier; 6 disagree (final NULL)
+FH = pd.DataFrame([
+    (1, "Bali", 4, True, "agree", True, 4, "complete", True, True, 600, 50, 50, 500),
+    (2, "Bali", 4, True, "agree_half_star", True, 4, "complete", False, False, 300, 10, 200, 90),
+    (3, "Bali", 4, True, "google_missing", True, 4, "needs_pass2", None, False, 100, 0, 0, 100),
+    (4, "Bali", 4, True, "agree", True, 4, "not_needed", None, False, None, None, None, None),
+    (5, "Bali", 4, False, None, False, None, "not_scraped", None, False, None, None, None, None),
+    (6, "Bali", 4, True, "disagree", False, None, "not_scraped", None, False, None, None, None, None)], columns=FCOLS)
+
+
+def test_funnel_stage_counts_and_monotone():
+    f = report.funnel(FH, {1: 300})
+    r = f[(f.destination == "Bali") & (f.star_class == "4")].iloc[0]
+    hotel_cols = [c for c in f.columns if c.startswith(("1_", "2_", "3_", "4_", "5_", "6_"))]
+    assert [int(r[c]) for c in hotel_cols] == [6, 5, 4, 3, 1, 1]  # listed, >=100, agree, scraped, eligible, final
+    assert all(a >= b for a, b in zip([r[c] for c in hotel_cols], [r[c] for c in hotel_cols][1:]))
+    assert r["7_reviews_selected (final_star_rating)"] == 300
+    assert r["status_disagree (star_class)"] == 1 and r["status_agree (star_class)"] == 2
+    t = f[(f.destination == "ALL") & (f.star_class == "ALL")].iloc[0]
+    assert t["1_hotels_listed (star_class)"] == 6
+
+
+def test_funnel_empty_cell_and_empty_frame_do_not_crash():
+    f = report.funnel(FH[FH.hotel_id == 6], {})
+    assert f["3_star_classes_agree (final_star_rating)"].sum() == 0
+    assert not report.funnel(FH.iloc[0:0], {}).empty  # still the ALL row, zeros
+
+
+def test_funnel_selected_maps_by_hotel_across_cells():
+    h = FH.copy()
+    h.loc[h.hotel_id == 2, ["destination", "final_star_rating"]] = ["Lombok", 5]
+    f = report.funnel(h, pd.Series({1: 300, 2: 120}))
+    sel = "7_reviews_selected (final_star_rating)"
+    assert f[(f.destination == "Bali") & (f.star_class == "4")][sel].iloc[0] == 300
+    assert f[(f.destination == "Lombok") & (f.star_class == "5")][sel].iloc[0] == 120
+    assert f[f.destination == "ALL"][sel].iloc[-1] == 420
+
+
+def test_acceptance_checks_flag_violations():
+    h = FH.copy()
+    extra = pd.DataFrame([dict(FH.iloc[0], hotel_id=100 + i) for i in range(30)])  # cell now has 31 final hotels
+    h = pd.concat([h, extra])
+    checks = dict((n, ok) for n, ok, _ in report.acceptance_checks(h, {1: 301}, {1: 301, 4: 5}, ceiling=30, max_selected=300))
+    assert not checks["cell ceiling"] and not checks["selected per hotel"] and not checks["not_needed without reviews"]
+    ok = report.acceptance_checks(FH, {1: 300}, {1: 300}, ceiling=30, max_selected=300)
+    assert all(o for _, o, _ in ok)
+
+
+def test_per_hotel_counts_final_sample_only(tmp_path):
+    p = report.write_review_counts(FH, {1: 300}, tmp_path)
+    c = pd.read_csv(p)
+    assert list(c.columns) == ["hotel_id", "destination", "final_star_rating", "n_raw_reviews", "n_out_of_window",
+                               "n_other_language", "n_eligible_reviews", "n_selected"]
+    assert c.hotel_id.tolist() == [1] and c.n_selected.tolist() == [300]
+
+
+class FunnelConn:
+    def execute(self, q):
+        if q == report.SQL["funnel_hotels"]:
+            return _Cur(FCOLS, [tuple(r) for r in FH.astype(object).where(FH.notna(), None).itertuples(index=False)])
+        assert q == report.SQL["review_counts"]
+        return _Cur(["hotel_id", "n_reviews", "n_selected"], [(1, 700, 300)])
+
+
+def test_report_funnel_end_to_end(tmp_path, monkeypatch):
+    _cfg(monkeypatch)
+    monkeypatch.setitem(report.load_config(), "reviews_per_hotel", 300)
+    out = report.report_funnel(conn=FunnelConn(), out_dir=tmp_path)
+    assert "PASS" in out and "FAIL" not in out and "star_basis" in out
+    assert (tmp_path / "funnel.csv").exists() and (tmp_path / "review_counts_by_hotel.csv").exists()
+
+
+
 def _cfg(monkeypatch):
     cfg = {"ceiling": 30, "rate_min_pages": 10, "target_raw_reviews_per_hotel": 600, "max_spend_usd": 85, "end_page": None}
     monkeypatch.setattr(report, "load_config", lambda: cfg)
@@ -129,12 +206,20 @@ def test_report_missing_ceiling_errors(monkeypatch):
         report.report_eligibility_test(conn=FakeConn())
 
 
-def test_plain_report_not_implemented():
-    import pytest
+def test_plain_report_runs_funnel(monkeypatch):
     from typer.testing import CliRunner
     from hotel_study.cli import app
+    monkeypatch.setattr(report, "report_funnel", lambda limit=None, destination=None: "FUNNEL OK")
     r = CliRunner().invoke(app, ["report"])
-    assert isinstance(r.exception, NotImplementedError)
+    assert r.exit_code == 0 and "FUNNEL OK" in r.output
+
+
+def test_report_eligibility_flag_still_dispatches(monkeypatch):
+    from typer.testing import CliRunner
+    from hotel_study.cli import app
+    monkeypatch.setattr(report, "report_eligibility_test", lambda limit=None, destination=None: "ELIG OK")
+    r = CliRunner().invoke(app, ["report", "--eligibility-test"])
+    assert r.exit_code == 0 and "ELIG OK" in r.output
 
 
 def test_report_never_modifies_config(tmp_path, monkeypatch):

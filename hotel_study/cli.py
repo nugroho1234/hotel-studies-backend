@@ -122,9 +122,7 @@ def pilot_sample_cmd(force: Annotated[bool, typer.Option("--force", help="Redraw
 @app.command("report")
 def report_cmd(eligibility_test: Annotated[bool, typer.Option("--eligibility-test", help="Eligibility-test counts report (read-only)")] = False,
                limit: Limit = None, destination: Destination = None) -> None:
-    """Print the eligibility-test report (counts only) and write output/eligibility_report.csv."""
-    if not eligibility_test:
-        raise NotImplementedError("funnel is Task 13")
-    from hotel_study.report import report_eligibility_test
+    """Plain: PRD 12 funnel + acceptance checks (output/funnel.csv). --eligibility-test: eligibility counts report."""
+    from hotel_study import report
 
-    typer.echo(report_eligibility_test(limit, destination))
+    typer.echo((report.report_eligibility_test if eligibility_test else report.report_funnel)(limit, destination))
