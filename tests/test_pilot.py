@@ -172,7 +172,7 @@ def test_indonesian_concentrated_in_one_stratum():
         [(d, s) for d in ("Bali", "Jakarta", "Surabaya") for s in (3, 4, 5)])]
     spec[0] = ("Bali", 3, [(k, 30, 30) for k in range(3)])  # only Bali|3 has Indonesian, capacity 12 < 20 wanted
     out = draw_pilot(frame(spec), 42, 4, 20, 100)
-    assert (out.language == "id").sum() == 11 and len(out) == 100  # Bali|3 quota is 11-12; all of it Indonesian
+    assert (out.language == "id").sum() == 12 and len(out) == 100  # all of the Bali|3 quota (12), fewer than min_id because only that stratum has any
 
 
 def test_summary_flags_shortfalls_27_hotel_like():
