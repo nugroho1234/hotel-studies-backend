@@ -21,15 +21,19 @@ def group_results(items: list[dict]) -> dict[str, list[dict]]:
     return out
 
 
+class SpendLimitReached(RuntimeError):
+    """No further paid run may start (cap reached, or a run's cost is unknown)."""
+
+
 def check_spend(conn, cfg: dict) -> None:
-    """Raise if a finished run has no usage recorded, or the spend cap is reached."""
-    row = conn.execute("SELECT run_id FROM scrape_runs WHERE finished_at IS NOT NULL AND usage_usd IS NULL LIMIT 1").fetchone()
+    """Raise if any run is unfinished or has no usage recorded (cost unknown), or the spend cap is reached."""
+    row = conn.execute("SELECT run_id FROM scrape_runs WHERE finished_at IS NULL OR usage_usd IS NULL LIMIT 1").fetchone()
     if row:
-        raise RuntimeError(f"scrape_runs row {row[0]} is finished but has NULL usage_usd. Read its cost in the Apify console, then run: "
-                           f"update scrape_runs set usage_usd = <value> where run_id = '{row[0]}'")
+        raise SpendLimitReached(f"scrape_runs row {row[0]} is unfinished or has NULL usage_usd. Rerun scrape-reviews to reconcile it, or read its cost in "
+                                f"the Apify console and run: update scrape_runs set finished_at = now(), usage_usd = <value> where run_id = '{row[0]}'")
     spent = conn.execute("SELECT coalesce(sum(usage_usd), 0) FROM scrape_runs").fetchone()[0]
     if spent >= cfg["max_spend_usd"]:
-        raise RuntimeError(f"max_spend_usd {cfg['max_spend_usd']} reached (spent {spent})")
+        raise SpendLimitReached(f"max_spend_usd {cfg['max_spend_usd']} reached (spent {spent})")
 
 
 def _wait_for_usage(client, run, max_wait: int, poll: int):

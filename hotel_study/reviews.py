@@ -5,12 +5,14 @@ from itertools import groupby
 from urllib.parse import urldefrag
 
 from apify_client import ApifyClient
+from apify_client.errors import ApifyApiError
 
 from hotel_study import db
 from hotel_study.db import upsert
 from hotel_study.cli import same_destination
 from hotel_study.config import get_secret, load_config, require_main_pass_ready
-from hotel_study.google import _wait_for_usage, check_spend
+from hotel_study.google import SpendLimitReached, _wait_for_usage, check_spend
+from hotel_study.parsing import parse_hotel_id
 from hotel_study.privacy import flatten_review, in_window
 
 log = logging.getLogger(__name__)
@@ -105,55 +107,105 @@ def _pages(items: list[dict]) -> dict[int, int]:
     return out
 
 
-def _attempt(client, conn, batch, cfg, pass_, end_page) -> bool:
+def _update_hotels(conn, run_id, items, ids, cfg, end_page) -> int:
+    """Ingest items, then SET each hotel's counts and status. Returns hotels updated. Hotels with no raw reviews stay not_scraped."""
+    counts = {int(h): c for h, c in ingest_items(conn, run_id, items, cfg).items()}
+    pages, n = _pages(items), 0
+    for h in ids:
+        c = counts.get(h)
+        if not c or c["n_raw"] == 0:
+            log.error("hotel %s: run returned no reviews; left not_scraped for a rerun", h)
+            continue
+        if c["n_bad_date"]:
+            log.warning("hotel %s: %d reviews with a missing/unparsable date were skipped", h, c["n_bad_date"])
+        status, elig = hotel_status(c["n_eligible"], pages.get(h, 0), end_page, cfg["reviews_per_hotel"], cfg["eligibility"]["threshold"])
+        conn.execute("UPDATE hotels SET n_raw_reviews=%s, n_out_of_window=%s, n_other_language=%s, n_eligible_reviews=%s, "
+                     "is_eligible=%s, scrape_status=%s, in_final_sample=%s WHERE hotel_id=%s",
+                     (c["n_raw"], c["n_out_of_window"], c["n_other_language"], c["n_eligible"], elig, status,
+                      final_sample(status, elig) if end_page is None else False, h))
+        n += 1
+    conn.commit()
+    return n
+
+
+def _finish(client, conn, run, n_items: int, cfg: dict, delete: bool) -> None:
+    """Record finished_at / item_count / usage_usd, then delete the remote dataset per config (privacy)."""
+    g = cfg["google"]
+    run, usage = _wait_for_usage(client, run, g["usage_max_wait_seconds"], g["usage_poll_seconds"])
+    row = {"run_id": run.id, "actor": ACTOR, "finished_at": datetime.now(timezone.utc), "item_count": n_items}
+    if usage is not None and (usage > 0 or not n_items):
+        row["usage_usd"] = usage  # left NULL if unconfirmed: check_spend then refuses further runs
+    upsert(conn, "scrape_runs", [row], "run_id")
+    conn.commit()
+    if delete and cfg["delete_remote_datasets"]:
+        client.dataset(run.default_dataset_id).delete()
+
+
+def _succeeded(run) -> bool:
+    return str(getattr(run.status, "value", run.status)) == "SUCCEEDED"
+
+
+def _attempt(client, conn, batch, cfg, pass_, end_page) -> int | None:
+    """One actor run. Returns hotels updated, or None if the run did not succeed. A crash mid-way leaves the row unfinished for reconcile()."""
     check_spend(conn, cfg)
     run_input = build_run_input([strip_fragment(h[3]) for h in batch], cfg, end_page)
     run = client.actor(ACTOR).start(run_input=run_input)
     upsert(conn, "scrape_runs", [{"run_id": run.id, "actor": ACTOR, "pass": pass_, "input": run_input,  # provenance before ingest
                                   "dataset_id": run.default_dataset_id, "started_at": datetime.now(timezone.utc)}], "run_id")
     conn.commit()
-    run = client.run(run.id).wait_for_finish()
-    ok = str(getattr(run.status, "value", run.status)) == "SUCCEEDED"
-    items = list(client.dataset(run.default_dataset_id).iterate_items()) if ok else []
-    if ok:
-        counts = {int(h): c for h, c in ingest_items(conn, run.id, items, cfg).items()}
-        pages = _pages(items)
-        for h, *_ in batch:
-            c = counts.get(h) or dict.fromkeys(("n_raw", "n_out_of_window", "n_other_language", "n_eligible", "n_bad_date"), 0)
-            if c["n_bad_date"]:
-                log.warning("hotel %s: %d reviews with a missing/unparsable date were skipped", h, c["n_bad_date"])
-            status, elig = hotel_status(c["n_eligible"], pages.get(h, 0), end_page, cfg["reviews_per_hotel"], cfg["eligibility"]["threshold"])
-            conn.execute("UPDATE hotels SET n_raw_reviews=%s, n_out_of_window=%s, n_other_language=%s, n_eligible_reviews=%s, "
-                         "is_eligible=%s, scrape_status=%s, in_final_sample=%s WHERE hotel_id=%s",
-                         (c["n_raw"], c["n_out_of_window"], c["n_other_language"], c["n_eligible"], elig, status,
-                          final_sample(status, elig) if end_page is None else False, h))
-        conn.commit()
-    g = cfg["google"]
-    run, usage = _wait_for_usage(client, run, g["usage_max_wait_seconds"], g["usage_poll_seconds"])
-    row = {"run_id": run.id, "actor": ACTOR, "finished_at": datetime.now(timezone.utc), "item_count": len(items)}
-    if usage is not None and (usage > 0 or not items):
-        row["usage_usd"] = usage  # left NULL if unconfirmed: check_spend then refuses further runs
-    upsert(conn, "scrape_runs", [row], "run_id")
-    conn.commit()
-    if ok and cfg["delete_remote_datasets"]:
-        client.dataset(run.default_dataset_id).delete()
-    if not ok:
-        log.error("Apify run %s ended with status %s", run.id, run.status)
-    return ok
+    done = client.run(run.id).wait_for_finish()
+    if done is None:
+        raise RuntimeError(f"Apify run {run.id}: wait_for_finish returned nothing; will be reconciled")
+    if not _succeeded(done):
+        log.error("Apify run %s ended with status %s", done.id, done.status)
+        _finish(client, conn, done, 0, cfg, delete=True)
+        return None
+    items = list(client.dataset(done.default_dataset_id).iterate_items())
+    n = _update_hotels(conn, done.id, items, [h[0] for h in batch], cfg, end_page)  # if this raises, dataset is kept for reconcile()
+    _finish(client, conn, done, len(items), cfg, delete=True)
+    return n
 
 
-def run_batch(client, conn, batch, cfg, pass_, end_page) -> bool:
-    """One actor run, retried once. False (hotels stay not_scraped) if both attempts fail; spend-cap errors propagate."""
+def run_batch(client, conn, batch, cfg, pass_, end_page) -> int | None:
+    """One actor run, retried once on run or Apify/network errors. None (hotels stay not_scraped) if both fail.
+    Spend-guard and DB errors propagate (a DB error leaves the run row unfinished for reconcile())."""
     for attempt in (1, 2):
         try:
-            if _attempt(client, conn, batch, cfg, pass_, end_page):
-                return True
-        except RuntimeError as e:
-            if "max_spend_usd" in str(e) or "usage_usd" in str(e):
-                raise
+            n = _attempt(client, conn, batch, cfg, pass_, end_page)
+            if n is not None:
+                return n
+        except SpendLimitReached:
+            raise
+        except (RuntimeError, ApifyApiError, OSError) as e:
             log.error("run failed (attempt %d): %s", attempt, e)
     log.error("hotels %s failed twice; left not_scraped", [h[0] for h in batch])
-    return False
+    return None
+
+
+def reconcile(client, conn, cfg: dict) -> int:
+    """Settle scrape_runs rows left unfinished by a crash: record usage, ingest a succeeded run's stored dataset
+    (never start a new run), delete datasets per config. Raises RuntimeError if anything cannot be settled."""
+    rows = conn.execute("SELECT run_id, dataset_id, input FROM scrape_runs WHERE finished_at IS NULL AND actor = %s", (ACTOR,)).fetchall()
+    for run_id, dataset_id, inp in rows:
+        try:
+            run = client.run(run_id).get()
+            if run is None:
+                raise RuntimeError("run not found")
+            status = str(getattr(run.status, "value", run.status))
+            if status in ("READY", "RUNNING"):
+                raise RuntimeError(f"still {status}; wait for it to end")
+            items, delete = [], True
+            if status == "SUCCEEDED":
+                inp = inp or {}
+                ids = [i for i in (parse_hotel_id(u) for u in inp.get("startUrls", [])) if i]
+                todo = [r[0] for r in conn.execute("SELECT hotel_id FROM hotels WHERE hotel_id = ANY(%s) AND scrape_status = 'not_scraped'", (ids,)).fetchall()]
+                if todo:
+                    items = list(client.dataset(dataset_id).iterate_items())
+                    _update_hotels(conn, run_id, items, todo, cfg, inp.get("endPage"))
+            _finish(client, conn, run, len(items), cfg, delete)
+        except (RuntimeError, ApifyApiError, OSError) as e:
+            raise RuntimeError(f"Could not reconcile unfinished run {run_id}: {e}. No new runs started; fix and rerun.") from e
+    return len(rows)
 
 
 def scrape_reviews(pass_: str, eligibility_test: bool, limit: int | None = None, destination: str | None = None, conn=None) -> str:
@@ -166,18 +218,20 @@ def scrape_reviews(pass_: str, eligibility_test: bool, limit: int | None = None,
     own = conn is None
     conn = conn or connect()
     try:
+        client = ApifyClient(get_secret("APIFY_TOKEN"))
+        reconcile(client, conn, cfg)
         # resume: only hotels still not_scraped; eligibility-test hotels have cell_order <= eligibility_test_size
         rows = conn.execute("SELECT hotel_id, destination, final_star_rating, review_url FROM hotels "
                             "WHERE in_eligibility_test AND scrape_status = 'not_scraped' "
                             "ORDER BY destination, final_star_rating, cell_order").fetchall()
         hotels = [r for r in rows if same_destination(r[1] or "", destination)][:limit]
-        client = ApifyClient(get_secret("APIFY_TOKEN"))
         done = failed = 0
         for b in make_batches(hotels, cfg["batch_size"]):
-            if run_batch(client, conn, b, cfg, "eligibility_test", None):
-                done += len(b)
-            else:
+            n = run_batch(client, conn, b, cfg, "eligibility_test", None)
+            if n is None:
                 failed += len(b)
+            else:
+                done += n
         return f"Eligibility test: {done} hotels scraped, {failed} failed."
     finally:
         if own:
