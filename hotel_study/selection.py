@@ -10,7 +10,7 @@ def select_for_hotel(reviews: list[dict], n: int | None = None) -> list[dict]:
     w = cfg["review_window"]
     out = [dict(r) for r in reviews]
     for r in out:
-        r["lang_ok"] = r["language"] in cfg["languages"] and r["translation_type"] is None
+        r["lang_ok"] = r["language"] in cfg["languages"] and r["translation_type"] is None and r.get("rating") is not None  # OSF: no overall rating = excluded
         r["is_selected"], r["selection_rank"] = False, None
     # window filter is defensive: ingest already drops out-of-window reviews. ISO dates compare as strings.
     pool = [r for r in out if r["lang_ok"] and str(w["start"]) <= str(r["published_date"]) <= str(w["end"])]
@@ -34,9 +34,9 @@ def select_reviews(limit: int | None = None, destination: str | None = None, con
                      "WHERE hotel_id IN (SELECT hotel_id FROM hotels WHERE NOT in_final_sample) "
                      "AND (is_selected OR selection_rank IS NOT NULL)")
         for hid, _ in hotels:
-            rows = conn.execute("SELECT review_id, published_date, language, translation_type FROM reviews "
+            rows = conn.execute("SELECT review_id, published_date, language, translation_type, rating FROM reviews "
                                 "WHERE hotel_id = %s", (hid,)).fetchall()
-            res = select_for_hotel([dict(zip(("review_id", "published_date", "language", "translation_type"), r))
+            res = select_for_hotel([dict(zip(("review_id", "published_date", "language", "translation_type", "rating"), r))
                                     for r in rows], cfg["reviews_per_hotel"])
             # NULL first so reassigning never trips reviews_selection_rank_uq mid-transaction.
             conn.execute("UPDATE reviews SET selection_rank = NULL WHERE hotel_id = %s", (hid,))

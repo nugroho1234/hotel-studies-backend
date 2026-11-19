@@ -105,6 +105,8 @@ class Conn:
         return self.hotels  # the SELECT already filters scrape_status; the fake returns what a DB would
 
     def commit(self): pass
+    stored = None
+    def fetchone(self): return self.stored  # stored n_raw_reviews for the no-endPage guard
 
 
 def item(rid, hid, page=1):
@@ -125,7 +127,7 @@ def env(monkeypatch):
     monkeypatch.setattr(reviews, "upsert", lambda c, t, r, k: (ev.append((t, r[0].get("pass"), "finished_at" in r[0])), rows.append(r[0])))
     monkeypatch.setattr(reviews, "check_spend", lambda c, cfg: ev.append("spend"))
     ev.rows, ev.ret = rows, [counts()]
-    monkeypatch.setattr(reviews, "ingest_items", lambda c, rid, items, cfg: ev.append("ingest") or ev.ret[0])
+    monkeypatch.setattr(reviews, "ingest_items", lambda c, rid, items, cfg, ids=None: ev.append("ingest") or ev.ret[0])
     return ev
 
 
@@ -306,3 +308,39 @@ def test_reconcile_google_row_unfetchable_aborts_with_hint(env, monkeypatch):
     with pytest.raises(RuntimeError, match="where run_id = 'g1'"):
         _reconcile_env(env, monkeypatch, client, conn)
     assert client.starts == 0
+
+
+def test_delete_failure_does_not_fail_or_retry(env, caplog):
+    class DelFail(Client):
+        def delete(self): raise OSError("boom")
+    client = DelFail([item(1, 1, 5)], events=env)
+    with caplog.at_level("ERROR"):
+        assert reviews.run_batch(client, Conn(env), [(1, "S", 3, "u1")], CFG, "eligibility_test", None) == 1
+    assert client.starts == 1 and "ds-" in caplog.text
+
+
+def _uh(stored, n_raw, end_page, items=None):
+    conn = Conn(Ev())
+    conn.stored = (stored,) if stored is not None else None
+    ev = conn.events
+    import hotel_study.reviews as r
+    orig = r.ingest_items
+    r.ingest_items = lambda *a, **k: {1: dict(n_raw=n_raw, n_out_of_window=0, n_other_language=0, n_eligible=n_raw, n_bad_date=0)}
+    try:
+        r._update_hotels(conn, "run", items if items is not None else [item(1, 1, 5)], [1], CFG, end_page)
+    finally:
+        r.ingest_items = orig
+    return hotel_events(ev)
+
+
+def test_no_endpage_smaller_run_keeps_stored_row(caplog):
+    with caplog.at_level("ERROR"):
+        assert _uh(600, 150, None) == []
+    assert "600" in caplog.text and "150" in caplog.text
+    assert len(_uh(600, 700, None)) == 1 and len(_uh(None, 150, None)) == 1
+    assert len(_uh(600, 150, 41)) == 1  # endPage runs are not guarded
+
+
+def test_missing_page_number_is_not_complete():
+    ev = _uh(None, 150, 41, items=[{"id": 1, "location": {"locationId": 1}}])
+    assert ev[0][5] == "needs_pass2"

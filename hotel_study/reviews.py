@@ -19,15 +19,22 @@ from hotel_study.privacy import flatten_review, in_window
 log = logging.getLogger(__name__)
 
 
-def split_items(items: list[dict], cfg: dict, salt: str) -> tuple[list[dict], dict]:
-    """Pure: flatten, drop out-of-window, set lang_ok, count per hotel."""
+def split_items(items: list[dict], cfg: dict, salt: str, hotel_ids=None) -> tuple[list[dict], dict]:
+    """Pure: flatten, drop foreign hotels and duplicate ids, drop out-of-window, set lang_ok, count per hotel."""
     w, langs = cfg["review_window"], cfg["languages"]
     rows, counts = [], defaultdict(lambda: dict.fromkeys(("n_raw", "n_out_of_window", "n_other_language", "n_eligible", "n_bad_date"), 0))
+    seen = set()
     for it in items:
         r = flatten_review(it, salt, cfg["subrating_labels"])  # raw item is never kept or written
         if r["review_id"] is None or r["hotel_id"] is None:
             log.error("skipping item without review_id/hotel_id (review id: %s)", r["review_id"])
             continue
+        if hotel_ids is not None and r["hotel_id"] not in hotel_ids:
+            log.error("dropping review %s: hotel %s is not in this batch (redirected listing?)", r["review_id"], r["hotel_id"])
+            continue
+        if r["review_id"] in seen:  # pages shift while scraping; first occurrence wins
+            continue
+        seen.add(r["review_id"])
         c = counts[r["hotel_id"]]
         c["n_raw"] += 1
         if r["published_date"] is None:
@@ -39,15 +46,17 @@ def split_items(items: list[dict], cfg: dict, salt: str) -> tuple[list[dict], di
             continue
         if r["translation_type"] is not None:
             log.error("review %s has translation_type=%r but no translation was requested", r["review_id"], r["translation_type"])
-        r["lang_ok"] = r["language"] in langs and r["translation_type"] is None
+        if r["rating"] is None:
+            log.warning("review %s has no overall rating; not eligible (counted in n_other_language)", r["review_id"])
+        r["lang_ok"] = r["language"] in langs and r["translation_type"] is None and r["rating"] is not None
         c["n_eligible" if r["lang_ok"] else "n_other_language"] += 1
         rows.append(r)
     return rows, dict(counts)
 
 
-def ingest_items(conn, run_id: str, items: list[dict], cfg: dict) -> dict:
+def ingest_items(conn, run_id: str, items: list[dict], cfg: dict, hotel_ids=None) -> dict:
     """Upsert in-window reviews (idempotent on review_id); returns {hotel_id: counts}. Caller commits."""
-    rows, counts = split_items(items, cfg, get_secret("USER_HASH_SALT"))
+    rows, counts = split_items(items, cfg, get_secret("USER_HASH_SALT"), hotel_ids)
     for r in rows:
         r["scrape_run_id"] = run_id
     db.upsert(conn, "reviews", rows, "review_id")
@@ -115,7 +124,7 @@ def _pages(items: list[dict]) -> dict[int, int]:
 
 def _update_hotels(conn, run_id, items, ids, cfg, end_page) -> int:
     """Ingest items, then SET each hotel's counts and status. Returns hotels updated. Hotels with no raw reviews stay not_scraped."""
-    counts = {int(h): c for h, c in ingest_items(conn, run_id, items, cfg).items()}
+    counts = {int(h): c for h, c in ingest_items(conn, run_id, items, cfg, set(ids)).items()}
     pages, n = _pages(items), 0
     for h in ids:
         c = counts.get(h)
@@ -124,7 +133,12 @@ def _update_hotels(conn, run_id, items, ids, cfg, end_page) -> int:
             continue
         if c["n_bad_date"]:
             log.warning("hotel %s: %d reviews with a missing/unparsable date were skipped", h, c["n_bad_date"])
-        status, elig = hotel_status(c["n_eligible"], pages.get(h, 0), end_page, cfg["reviews_per_hotel"], cfg["eligibility"]["threshold"])
+        if end_page is None:  # a no-endPage re-scrape must not replace a bigger stored result with a smaller, possibly truncated one
+            row = conn.execute("SELECT n_raw_reviews FROM hotels WHERE hotel_id=%s", (h,)).fetchone()
+            if row and row[0] is not None and c["n_raw"] < row[0]:
+                log.error("hotel %s: no-endPage run returned %d raw reviews, fewer than the stored %d; kept the stored row", h, c["n_raw"], row[0])
+                continue
+        status, elig = hotel_status(c["n_eligible"], pages.get(h, end_page or 0), end_page, cfg["reviews_per_hotel"], cfg["eligibility"]["threshold"])
         conn.execute("UPDATE hotels SET n_raw_reviews=%s, n_out_of_window=%s, n_other_language=%s, n_eligible_reviews=%s, "
                      "is_eligible=%s, scrape_status=%s, in_final_sample = CASE WHEN in_eligibility_test THEN %s ELSE in_final_sample END "
                      "WHERE hotel_id=%s",
@@ -145,7 +159,10 @@ def _finish(client, conn, run, n_items: int, cfg: dict, delete: bool, actor: str
     upsert(conn, "scrape_runs", [row], "run_id")
     conn.commit()
     if delete and cfg["delete_remote_datasets"]:
-        client.dataset(run.default_dataset_id).delete()
+        try:
+            client.dataset(run.default_dataset_id).delete()
+        except (ApifyApiError, OSError) as e:  # the batch is already ingested and recorded; never retry because of this
+            log.error("could not delete remote dataset %s: %s", run.default_dataset_id, e)
 
 
 def _succeeded(run) -> bool:
@@ -237,7 +254,7 @@ def _run(client, conn, cell, rows, pass_, end_page, cfg) -> None:
         return n, [r[0] for r in rs if now[r[0]][2] == "not_scraped" or (pass_ == "2" and now[r[0]][2] == "needs_pass2" and now[r[0]][3] is None)]
     n1, left = attempt(rows)
     if left and pass_ == "2":  # pass 1 had ~end_page pages for these, so zero now is a scraper failure; keep their counts, one attempt per rerun
-        raise RuntimeError(f"cell {cell}: undecided hotels {left} returned no reviews in the no-endPage re-scrape; check them manually, then rerun")
+        raise RuntimeError(f"cell {cell}: undecided hotels {left} returned no usable result (no reviews, or fewer than stored) in the no-endPage re-scrape; check them manually, then rerun")
     if left:  # retry once; still nothing means genuinely no reviews since the window start
         _, left = attempt([r for r in rows if r[0] in left])
         if left and (n1 == 0 or len(rows) == 1):  # nothing else in the run returned anything: scraper failure vs real zero is ambiguous
@@ -265,14 +282,15 @@ def scrape_cell(client, conn, cell: tuple, cfg: dict) -> int:
         cut = [i for i, r in enumerate(rows) if r[3] is True][ceiling - 1] if n_elig >= ceiling else len(rows)
         undecided = [r for r in rows[:cut] if r[2] == "needs_pass2" and r[3] is None]
         if undecided:
-            _run(client, conn, cell, undecided[:size], "2", None, cfg)
+            _run(client, conn, cell, undecided[:cfg["no_endpage_batch_size"]], "2", None, cfg)
             continue
-        todo = [r for r in rows if r[2] == "not_scraped"]
-        if cell_done(n_elig, ceiling) or not todo:
+        # not_scraped hotels ordered before the ceiling-th eligible one keep their place in the sample, so they are scraped first
+        todo = [r for r in rows[:cut] if r[2] == "not_scraped"]
+        if not todo:
             break
         tested = [r for r in rows if r[4] and r[2] != "not_scraped"]
         share = sum(r[3] is True for r in tested) / len(tested) if tested else 0.0  # eligibility-test eligible / scraped
-        k = next_batch_size(ceiling - n_elig, share, size, len(todo))  # only reached with needed > 0 and remaining > 0
+        k = min(size, len(todo)) if cell_done(n_elig, ceiling) else next_batch_size(ceiling - n_elig, share, size, len(todo))  # needed > 0 and remaining > 0 here
         _run(client, conn, cell, todo[:k], "1", cfg["end_page"], cfg)
     conn.execute("UPDATE hotels SET scrape_status = 'not_needed' WHERE destination = %s AND final_star_rating = %s AND scrape_status = 'not_scraped'", cell)
     keep = [r[0] for r in rows if r[3] is True][:ceiling]
@@ -295,7 +313,7 @@ def scrape_pass2(client, conn, cfg: dict, limit: int | None = None, destination:
                         "WHERE in_final_sample AND scrape_status = 'needs_pass2' ORDER BY destination, final_star_rating, cell_order").fetchall()
     hotels = [r for r in rows if same_destination(r[1] or "", destination)][:limit]
     done = failed = 0
-    for b in make_batches(hotels, cfg["batch_size"]):
+    for b in make_batches(hotels, cfg["no_endpage_batch_size"]):
         n = run_batch(client, conn, b, cfg, "2", None)
         if n is None:
             failed += len(b)

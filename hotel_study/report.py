@@ -161,6 +161,7 @@ def acceptance_checks(hotels: pd.DataFrame, selected_counts, review_counts, ceil
     bad = int((ids.map(rev).fillna(0) > 0).sum())
     return [("cell ceiling", over_cell.empty, f"{len(over_cell)} cells above {ceiling} final-sample hotels"),
             ("selected per hotel", over_sel.empty, f"{len(over_sel)} hotels above {max_selected} selected reviews"),
+            ("final sample all eligible", bool(_b(fin.is_eligible).all()), f"{int((~_b(fin.is_eligible)).sum())} final-sample hotels not eligible"),
             ("not_needed without reviews", bad == 0, f"{bad} not_needed hotels have reviews")]
 
 
@@ -209,4 +210,6 @@ def report_funnel(limit: int | None = None, destination: str | None = None, conn
              "Stage 7 counts reviews, not hotels."]
     lines += [f"{'PASS' if ok else 'FAIL'}: {n} ({d})"
               for n, ok, d in acceptance_checks(hotels, sel, n_rev, cfg["ceiling"], cfg["reviews_per_hotel"])]
+    zero = hotels[(hotels.scrape_status == "complete") & (hotels.n_raw_reviews == 0)].hotel_id.tolist()
+    lines.append(f"Hotels complete with 0 raw reviews (zero-marked; check manually): {zero}")
     return "\n".join(lines) + f"\n\nWrote {p1} and {p2}"

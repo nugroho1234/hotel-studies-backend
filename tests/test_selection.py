@@ -4,7 +4,7 @@ from hotel_study.selection import select_for_hotel, select_reviews
 
 
 def rv(i, d=None, lang="en", tt=None):
-    return {"review_id": i, "published_date": d or date(2023, 1, 1) + timedelta(days=i), "language": lang, "translation_type": tt}
+    return {"review_id": i, "published_date": d or date(2023, 1, 1) + timedelta(days=i), "language": lang, "translation_type": tt, "rating": 4}
 
 
 def test_400_eligible_selects_300_newest_first():
@@ -67,7 +67,7 @@ class FakeConn:
 
 
 def test_select_reviews_only_final_complete_resets_rank_first_and_counts():
-    revs = {1: [(i, date(2024, 1, 1) + timedelta(days=i), "en", None) for i in range(5)] + [(99, date(2024, 1, 1), "fr", None)]}
+    revs = {1: [(i, date(2024, 1, 1) + timedelta(days=i), "en", None, 5) for i in range(5)] + [(99, date(2024, 1, 1), "fr", None, 5)]}
     c = FakeConn([(1, "Bali")], revs)
     select_reviews(conn=c)
     sql = [q for q, _ in c.log]
@@ -85,3 +85,8 @@ def test_select_reviews_only_final_complete_resets_rank_first_and_counts():
 
 def params_is(c, i, hid):
     return c.log[i][1] == (hid,)
+
+
+def test_no_rating_never_selected():
+    out = {r["review_id"]: r for r in select_for_hotel([rv(1), dict(rv(2), rating=None)], 300)}
+    assert out[1]["is_selected"] and not out[2]["is_selected"] and out[2]["lang_ok"] is False

@@ -4,7 +4,7 @@ from hotel_study import reviews
 from hotel_study.cells import next_batch_size
 from hotel_study.google import SpendLimitReached
 
-CFG = {"review_locale": "id", "review_window": {"start": "2023-01-01", "end": "2025-12-31"}, "batch_size": 3, "ceiling": 3, "end_page": 41,
+CFG = {"review_locale": "id", "review_window": {"start": "2023-01-01", "end": "2025-12-31"}, "batch_size": 3, "no_endpage_batch_size": 2, "ceiling": 3, "end_page": 41,
        "eligibility": {"threshold": 100}, "reviews_per_hotel": 300, "max_spend_usd": 85}
 CELL = ("Bali", 4)
 
@@ -358,3 +358,28 @@ def test_update_hotels_writes_final_sample_only_for_eligibility_test(monkeypatch
 
 def item(rid, hid, page=1):
     return {"id": rid, "location": {"locationId": hid}, "inputSource": {"pageNumber": page}}
+
+
+def test_earlier_not_scraped_hotel_scraped_before_cell_closes(monkeypatch):
+    # hotels 2,3,4 (eligibility test) already reach the ceiling; hotel 1 is earlier in cell_order and still not_scraped
+    w = _world({i: E for i in range(1, 7)}, monkeypatch, tested=(2, 3, 4))
+    reviews.scrape_cell(None, Conn(w), CELL, CFG)
+    assert w.calls == [([1], "1", 41)] and w.h[1]["status"] == "complete"
+    assert [i for i, h in w.h.items() if h["final"]] == [1, 2, 3] and w.h[5]["status"] == w.h[6]["status"] == "not_needed"
+
+
+def test_undecided_batches_capped_by_no_endpage_batch_size(monkeypatch):
+    w = _world({i: (80, 120) for i in range(1, 6)}, monkeypatch)
+    for i in (1, 2, 3):
+        w.h[i].update(status="needs_pass2", elig=None)
+    reviews.scrape_cell(None, Conn(w), CELL, CFG | {"ceiling": 2})
+    p2 = [c for c in w.calls if c[1] == "2"]
+    assert p2 and all(len(c[0]) <= 2 and c[2] is None for c in p2)
+
+
+def test_pass2_batches_capped_by_no_endpage_batch_size(monkeypatch):
+    calls = []
+    monkeypatch.setattr(reviews, "run_batch", lambda c, conn, b, cfg, p, e: calls.append(len(b)) or len(b))
+    rows = [(i, "Bali", 4, f"u{i}") for i in range(1, 6)]
+    reviews.scrape_pass2(None, P2Conn(rows), CFG)
+    assert calls == [2, 2, 1]

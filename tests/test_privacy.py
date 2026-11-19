@@ -150,3 +150,31 @@ def test_english_unknown_and_messy_subrating_labels():
     r = _sub([("Value", 5), ("  SLEEP quality ", 3), ("kebersihan", 4), ("Foo", 2)])
     assert r["subrating_value"] == 5 and r["subrating_sleep_quality"] == 3 and r["subrating_cleanliness"] == 4
     assert r["subrating_rooms"] is None and r["subratings_other"] == {"Foo": 2}
+
+
+def test_foreign_location_dropped_and_logged(caplog):
+    items = [item(id=1), item(id=2, location={"locationId": 99}), item(id=3, location={"locationId": 7})]
+    with caplog.at_level(logging.ERROR):
+        rows, counts = split_items(items, CFG, "s", hotel_ids={7})
+    assert [r["review_id"] for r in rows] == [1, 3] and set(counts) == {7} and counts[7]["n_raw"] == 2
+    assert "99" in caplog.text and "Good stay" not in caplog.text
+
+
+def test_ingest_items_drops_foreign_before_upsert(monkeypatch):
+    seen = []
+    monkeypatch.setattr("hotel_study.reviews.get_secret", lambda n: "s")
+    monkeypatch.setattr("hotel_study.reviews.db.upsert", lambda c, t, rows, k: seen.extend(rows))
+    ingest_items("conn", "run1", [item(id=1), item(id=2, location={"locationId": 99})], CFG, hotel_ids={7})
+    assert [r["review_id"] for r in seen] == [1]
+
+
+def test_no_rating_never_eligible():
+    rows, counts = split_items([item(id=1, rating=None), item(id=2)], CFG, "s")
+    assert [r["lang_ok"] for r in rows] == [False, True]
+    assert counts[7]["n_eligible"] == 1 and counts[7]["n_raw"] == 2 and counts[7]["n_other_language"] == 1
+
+
+def test_duplicate_review_ids_counted_once_first_wins():
+    rows, counts = split_items([item(id=1, title="first"), item(id=1, title="second"), item(id=2)], CFG, "s")
+    assert [(r["review_id"], r["title"]) for r in rows] == [(1, "first"), (2, "Nice")]
+    assert counts[7]["n_raw"] == 2 and counts[7]["n_eligible"] == 2

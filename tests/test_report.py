@@ -148,6 +148,8 @@ def test_acceptance_checks_flag_violations():
     h = pd.concat([h, extra])
     checks = dict((n, ok) for n, ok, _ in report.acceptance_checks(h, {1: 301}, {1: 301, 4: 5}, ceiling=30, max_selected=300))
     assert not checks["cell ceiling"] and not checks["selected per hotel"] and not checks["not_needed without reviews"]
+    bad = FH.copy(); bad.loc[bad.hotel_id == 1, "is_eligible"] = False
+    assert not dict((n, o) for n, o, _ in report.acceptance_checks(bad, {1: 300}, {1: 300}, 30, 300))["final sample all eligible"]
     ok = report.acceptance_checks(FH, {1: 300}, {1: 300}, ceiling=30, max_selected=300)
     assert all(o for _, o, _ in ok)
 
@@ -229,3 +231,14 @@ def test_report_never_modifies_config(tmp_path, monkeypatch):
     _cfg(monkeypatch)
     report.report_eligibility_test(conn=FakeConn(), out_dir=tmp_path)
     assert p.read_bytes() == before
+
+
+def test_report_lists_zero_marked_hotels(tmp_path, monkeypatch):
+    _cfg(monkeypatch)
+    monkeypatch.setitem(report.load_config(), "reviews_per_hotel", 300)
+    FH.loc[FH.hotel_id == 2, "n_raw_reviews"] = 0
+    try:
+        out = report.report_funnel(conn=FunnelConn(), out_dir=tmp_path)
+    finally:
+        FH.loc[FH.hotel_id == 2, "n_raw_reviews"] = 300
+    assert "complete with 0 raw reviews" in out and "[2]" in out

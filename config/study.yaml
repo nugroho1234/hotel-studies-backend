@@ -14,6 +14,7 @@ google: {top_results: 3, hl: en, gl: id, fetch_details: false, queries_per_run: 
 name_match: {accept: 90, uncertain: 75}
 review_locale: id       # TripAdvisor domain for reviews; without it Indonesian reviews come back as English MACHINE translations
 batch_size: 10
+no_endpage_batch_size: 3   # runs without endPage fetch full history (expensive): keep batches small (pass 2, undecided re-scrapes)
 concurrency: 1
 target_raw_reviews_per_hotel: 600   # PRD: about 600 raw reviews per hotel; used only to suggest end_page
 rate_min_pages: 10   # only hotels with at least this many pages enter the reviews-per-page estimate
