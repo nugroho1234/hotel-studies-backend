@@ -6,7 +6,9 @@ from datetime import date
 from hotel_study.privacy import flatten_review, hash_user_id, in_window
 from hotel_study.reviews import ingest_items, split_items
 
-CFG = {"review_window": {"start": "2023-01-01", "end": "2025-12-31"}, "languages": ["en", "id"]}
+from hotel_study.config import load_config
+
+CFG = {"subrating_labels": load_config()["subrating_labels"], "review_window": {"start": "2023-01-01", "end": "2025-12-31"}, "languages": ["en", "id"]}
 START, END = "2023-01-01", "2025-12-31"
 
 
@@ -131,3 +133,20 @@ def test_malformed_items_skipped_and_logged(caplog):
     assert [r["review_id"] for r in rows] == [9]
     assert None not in counts and counts[7]["n_bad_date"] == 1 and counts[7]["n_out_of_window"] == 0
     assert counts[7]["n_raw"] == 2
+
+
+def _sub(labels):
+    return flatten_review(item(additionalRatings=[{"ratingLabel": k, "rating": v} for k, v in labels]), "s")
+
+
+def test_indonesian_subrating_labels():
+    r = _sub([("Layanan", 1), ("Kualitas Tidur", 2), ("Lokasi", 3), ("Kamar", 4), ("Kebersihan", 5), ("Nilai", 2)])
+    assert (r["subrating_service"], r["subrating_sleep_quality"], r["subrating_location"], r["subrating_rooms"],
+            r["subrating_cleanliness"], r["subrating_value"]) == (1, 2, 3, 4, 5, 2)
+    assert r["subratings_other"] is None
+
+
+def test_english_unknown_and_messy_subrating_labels():
+    r = _sub([("Value", 5), ("  SLEEP quality ", 3), ("kebersihan", 4), ("Foo", 2)])
+    assert r["subrating_value"] == 5 and r["subrating_sleep_quality"] == 3 and r["subrating_cleanliness"] == 4
+    assert r["subrating_rooms"] is None and r["subratings_other"] == {"Foo": 2}

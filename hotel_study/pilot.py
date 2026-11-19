@@ -44,7 +44,15 @@ def _greedy(rows: list, n: int, per_hotel: dict, cap: int) -> list:
     return got
 
 
-def draw_pilot(df: pd.DataFrame, seed: int, max_per_hotel: int, min_id: int, total: int | None = None) -> pd.DataFrame:
+def capacity(rows: list, max_per_hotel: int) -> int:
+    """Most reviews drawable from rows: sum over hotels of min(reviews, max_per_hotel)."""
+    n: dict = {}
+    for r in rows:
+        n[r["hotel_id"]] = n.get(r["hotel_id"], 0) + 1
+    return sum(min(c, max_per_hotel) for c in n.values())
+
+
+def draw_pilot(df: pd.DataFrame, seed: int, max_per_hotel: int, min_id: int, total: int = 100) -> pd.DataFrame:
     """Stratified draw (destination|star), equal allocation, at most max_per_hotel per hotel.
     1) capacity of a stratum = sum over hotels of min(reviews, max_per_hotel); allocate() sets its quota.
     2) reserve min_id Indonesian picks: spread over strata with allocate(), limited by each stratum's
@@ -55,13 +63,9 @@ def draw_pilot(df: pd.DataFrame, seed: int, max_per_hotel: int, min_id: int, tot
     for r in rows:
         strata.setdefault(f"{r['destination']}|{r['final_star_rating']}", []).append(r)
 
-    def cap_of(rs):
-        n: dict = {}
-        for r in rs:
-            n[r["hotel_id"]] = n.get(r["hotel_id"], 0) + 1
-        return sum(min(c, max_per_hotel) for c in n.values())
+    cap_of = lambda rs: capacity(rs, max_per_hotel)  # noqa: E731
 
-    quota = allocate({k: cap_of(v) for k, v in strata.items()}, load_config()["pilot_size"] if total is None else total)
+    quota = allocate({k: cap_of(v) for k, v in strata.items()}, total)
     id_cap = {k: min(cap_of([r for r in v if r["language"] == "id"]), quota[k]) for k, v in strata.items()}
     id_quota = allocate(id_cap, min_id)
     rng, picked = random.Random(seed), []
@@ -77,19 +81,30 @@ def draw_pilot(df: pd.DataFrame, seed: int, max_per_hotel: int, min_id: int, tot
 
 
 
-def summarise(df: pd.DataFrame, max_per_hotel: int) -> str:
-    cap = (f"Per-hotel cap: {max_per_hotel} (pilot_max_per_hotel; deviation from the registered 2)" if max_per_hotel != 2
+def summarise(df: pd.DataFrame, src: pd.DataFrame, cfg: dict) -> str:
+    cap_n, n_id = cfg["pilot_max_per_hotel"], int((df.language == "id").sum())
+    cap = (f"Per-hotel cap: {cap_n} (pilot_max_per_hotel; deviation from the registered 2)" if cap_n != 2
            else "Per-hotel cap: 2 (pilot_max_per_hotel, as registered)")
     strata = ", ".join(f"{k}: {n}" for k, n in df.groupby("pilot_stratum").size().items())
-    return (f"Pilot: {len(df)} reviews in {df.pilot_stratum.nunique()} strata ({strata}). "
-            f"Indonesian: {int((df.language == 'id').sum())}. "
-            f"Max reviews per hotel: {int(df.groupby('hotel_id').size().max()) if len(df) else 0}. {cap}")
+    lines = [f"Pilot: {len(df)} reviews in {df.pilot_stratum.nunique()} strata ({strata}).",
+             f"Indonesian: {n_id}. Max reviews per hotel: {int(df.groupby('hotel_id').size().max()) if len(df) else 0}. {cap}"]
+    rows = src.to_dict("records")
+    if len(df) < cfg["pilot_size"]:
+        lines.append(f"SHORT of target (capacity): got {len(df)} of {cfg['pilot_size']}; pooled capacity under the per-hotel cap is {capacity(rows, cap_n)}.")
+    if n_id < cfg["pilot_min_id"]:
+        id_cap = capacity([r for r in rows if r["language"] == "id"], cap_n)
+        lines.append(f"SHORT of Indonesian minimum: got {n_id} of {cfg['pilot_min_id']}; "
+                     + (f"capacity is the reason (only {id_cap} drawable)." if id_cap < cfg["pilot_min_id"]
+                        else "capacity is not the reason (stratum quotas limited it)."))
+    return "\n".join(lines)
 
 
 def pilot_sample(force: bool = False, limit: int | None = None, destination: str | None = None,
                  conn=None, out_dir: Path | None = None) -> str:
     """Flag and export the pilot reviews. Refuses if a pilot already exists; --force clears it and redraws."""
     cfg = load_config()
+    if force and (limit or destination):
+        raise RuntimeError("pilot-sample refused: --force clears every pilot flag, so it cannot be combined with --limit or --destination")
     own = conn is None
     conn = conn or connect()
     try:
@@ -100,12 +115,12 @@ def pilot_sample(force: bool = False, limit: int | None = None, destination: str
             "r.language, r.rating, r.trip_info_trip_type, r.subrating_value, r.subrating_rooms, r.subrating_location, "
             "r.subrating_cleanliness, r.subrating_service, r.subrating_sleep_quality, r.title, r.text "
             "FROM reviews r JOIN hotels h USING (hotel_id) "
-            "WHERE r.is_selected AND h.in_final_sample ORDER BY r.review_id").fetchall()
+            "WHERE r.is_selected AND h.in_final_sample AND h.scrape_status = 'complete' ORDER BY r.review_id").fetchall()
         df = pd.DataFrame(rows, columns=SELECT_COLS)
         df = df[df.destination.map(lambda d: same_destination(d or "", destination))]
         if limit:
             df = df[df.hotel_id.isin(sorted(df.hotel_id.unique())[:limit])]
-        out = draw_pilot(df, cfg["seed"], cfg["pilot_max_per_hotel"], cfg["pilot_min_id"])
+        out = draw_pilot(df, cfg["seed"], cfg["pilot_max_per_hotel"], cfg["pilot_min_id"], cfg["pilot_size"])
         conn.execute("UPDATE reviews SET is_pilot = false, pilot_stratum = NULL WHERE is_pilot OR pilot_stratum IS NOT NULL")
         for k, g in out.groupby("pilot_stratum"):
             conn.execute("UPDATE reviews SET is_pilot = true, pilot_stratum = %s WHERE review_id = ANY(%s)",
@@ -114,7 +129,7 @@ def pilot_sample(force: bool = False, limit: int | None = None, destination: str
         path = (out_dir or ROOT / "output") / "pilot_100.csv"
         path.parent.mkdir(parents=True, exist_ok=True)
         out[EXPORT_COLS].to_csv(path, index=False)
-        return f"{summarise(out, cfg['pilot_max_per_hotel'])} Wrote {path}."
+        return f"{summarise(out, df, cfg)} Wrote {path}."
     finally:
         if own:
             conn.close()

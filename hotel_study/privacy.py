@@ -2,7 +2,8 @@ import hashlib
 import re
 from datetime import date
 
-SUBRATINGS = {"value", "rooms", "location", "cleanliness", "service", "sleep quality"}
+from hotel_study.config import load_config
+
 CLOSINGS = {"best regards", "warm regards", "kind regards", "regards", "sincerely", "salam",
             "hormat kami", "terima kasih"}
 
@@ -42,15 +43,17 @@ def _clean_owner_text(text, own_names):
     return text
 
 
-def flatten_review(item: dict, salt: str) -> dict:
+def flatten_review(item: dict, salt: str, labels: dict | None = None) -> dict:
     """Map one raw Apify item to PRD section 4 reviews columns. PII is never copied."""
     user, owner = item.get("userProfile") or {}, item.get("ownerResponse") or {}
     trip = item.get("tripInfo") or {}
+    labels = labels or load_config()["subrating_labels"]  # column suffix -> accepted labels (en, id)
+    lookup = {l.strip().lower(): k for k, ls in labels.items() for l in ls}
     sub, other = {}, {}
     for a in item.get("additionalRatings") or []:
         label, val = a.get("ratingLabel"), a.get("rating", a.get("value"))
-        if label and label.strip().lower() in SUBRATINGS:
-            sub["subrating_" + label.strip().lower().replace(" ", "_")] = val
+        if label and label.strip().lower() in lookup:
+            sub["subrating_" + lookup[label.strip().lower()]] = val
         elif label:
             other[label] = val
     row = {

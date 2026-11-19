@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 from hotel_study.config import load_config
-from hotel_study.pilot import EXPORT_COLS, SELECT_COLS, allocate, draw_pilot, pilot_sample
+from hotel_study.pilot import summarise, EXPORT_COLS, SELECT_COLS, allocate, draw_pilot, pilot_sample
 
 
 def test_allocate_equal_remainder_to_largest():
@@ -112,7 +112,7 @@ def test_refuses_without_force_when_pilot_exists(tmp_path):
     c = FakeConn(True, db_rows())
     with pytest.raises(RuntimeError, match="--force"):
         pilot_sample(False, conn=c, out_dir=tmp_path)
-    assert not any(q.lstrip().startswith(("UPDATE", "SELECT review_id")) for q in c.log) and c.commits == 0
+    assert not any(q.lstrip().startswith(("UPDATE", "SELECT r.review_id")) for q in c.log) and c.commits == 0
 
 
 def test_force_clears_old_flags_first_then_sets_and_exports(tmp_path):
@@ -130,3 +130,59 @@ def test_export_columns_exact():
                            "language", "rating", "trip_info_trip_type", "subrating_value", "subrating_rooms",
                            "subrating_location", "subrating_cleanliness", "subrating_service",
                            "subrating_sleep_quality", "title", "text"]
+
+
+def test_force_refused_with_limit_or_destination(tmp_path):
+    for kw in ({"limit": 1}, {"destination": "Bali"}):
+        c = FakeConn(True, db_rows())
+        with pytest.raises(RuntimeError, match="--force"):
+            pilot_sample(True, conn=c, out_dir=tmp_path, **kw)
+        assert c.log == [] and c.commits == 0
+
+
+def test_source_query_requires_complete_hotels(tmp_path):
+    c = FakeConn(False, db_rows())
+    pilot_sample(False, conn=c, out_dir=tmp_path)
+    assert any("scrape_status = 'complete'" in q and "in_final_sample" in q for q in c.log)
+
+
+def frame(spec):
+    """spec: list of (dest, star, [(hotel_id, n_reviews, n_id)...])"""
+    rows, rid = [], 1
+    for d, st, hotels in spec:
+        for h, n, nid in hotels:
+            for i in range(n):
+                rows.append({"review_id": rid, "hotel_id": h, "destination": d, "final_star_rating": st,
+                             "language": "id" if i < nid else "en"})
+                rid += 1
+    return pd.DataFrame(rows)
+
+
+def test_capacity_zero_stratum_and_pooled_shortfall_mixed_hotels():
+    spec = [("Bali", 3, [(1, 50, 0), (2, 1, 0), (3, 0, 0)]), ("Bali", 4, [(4, 50, 0), (5, 50, 0), (6, 2, 0)]),
+            ("Jakarta", 5, [(7, 2, 0)])]
+    df = frame(spec)  # capacities with cap 4: 5, 10, 2 -> 17 < 100
+    out = draw_pilot(df, 42, 4, 20, 100)
+    assert len(out) == 17 and out.groupby("hotel_id").size().max() <= 4 and out.review_id.is_unique
+    assert set(out.pilot_stratum) == {"Bali|3", "Bali|4", "Jakarta|5"}
+
+
+def test_indonesian_concentrated_in_one_stratum():
+    spec = [(d, s, [(i * 10 + k, 30, 0) for k in range(3)]) for i, (d, s) in enumerate(
+        [(d, s) for d in ("Bali", "Jakarta", "Surabaya") for s in (3, 4, 5)])]
+    spec[0] = ("Bali", 3, [(k, 30, 30) for k in range(3)])  # only Bali|3 has Indonesian, capacity 12 < 20 wanted
+    out = draw_pilot(frame(spec), 42, 4, 20, 100)
+    assert (out.language == "id").sum() == 11 and len(out) == 100  # Bali|3 quota is 11-12; all of it Indonesian
+
+
+def test_summary_flags_shortfalls_27_hotel_like():
+    spec = [(d, s, [(100 * i + k, 6, 1) for k in range(3)]) for i, (d, s) in enumerate(
+        [(d, s) for d in ("Bali", "Jakarta", "Surabaya") for s in (3, 4, 5)])]
+    df = frame(spec)
+    out = draw_pilot(df, 42, 4, 20, 100)  # capacity 12/stratum -> 100 fits, but only 27 Indonesian exist
+    cfg = {"pilot_max_per_hotel": 4, "pilot_size": 100, "pilot_min_id": 40}
+    msg = summarise(out, df, cfg)
+    assert "deviation from the registered 2" in msg and "SHORT of Indonesian minimum" in msg and "capacity is the reason" in msg
+    small = df[df.hotel_id % 100 == 0]
+    out2 = draw_pilot(small, 42, 4, 20, 100)
+    assert "SHORT of target (capacity): got" in summarise(out2, small, cfg | {"pilot_min_id": 1})

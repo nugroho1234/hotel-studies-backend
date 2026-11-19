@@ -23,7 +23,7 @@ def split_items(items: list[dict], cfg: dict, salt: str) -> tuple[list[dict], di
     w, langs = cfg["review_window"], cfg["languages"]
     rows, counts = [], defaultdict(lambda: dict.fromkeys(("n_raw", "n_out_of_window", "n_other_language", "n_eligible", "n_bad_date"), 0))
     for it in items:
-        r = flatten_review(it, salt)  # raw item is never kept or written
+        r = flatten_review(it, salt, cfg["subrating_labels"])  # raw item is never kept or written
         if r["review_id"] is None or r["hotel_id"] is None:
             log.error("skipping item without review_id/hotel_id (review id: %s)", r["review_id"])
             continue

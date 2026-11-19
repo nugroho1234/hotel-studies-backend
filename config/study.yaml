@@ -22,3 +22,10 @@ pilot_size: 100
 pilot_min_id: 20
 pilot_max_per_hotel: 4   # PRD/OSF say 2; raised for the early 27-hotel pilot (logged deviation)
 google_prescreen_only: true
+subrating_labels:   # ratingLabel text per subrating column (locale en and id), matched case-insensitively
+  value: [Value, Nilai]
+  rooms: [Rooms, Kamar]
+  location: [Location, Lokasi]
+  cleanliness: [Cleanliness, Kebersihan]
+  service: [Service, Layanan]
+  sleep_quality: [Sleep Quality, Kualitas Tidur]
