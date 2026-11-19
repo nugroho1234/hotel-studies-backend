@@ -69,3 +69,16 @@ def finalise_stars_cmd(csv: Path, limit: Limit = None, destination: Destination 
     except OpenManualChecks as e:
         typer.echo(str(e), err=True)
         raise typer.Exit(1)
+
+
+@app.command("order-cells")
+def order_cells_cmd(limit: Annotated[int | None, typer.Option("--limit", help="Order at most N cells (test runs)")] = None,
+                    destination: Destination = None) -> None:
+    """Draw the seeded random hotel order within each destination x star cell (safe to rerun until reviews exist)."""
+    from hotel_study.cells import order_cells
+
+    try:
+        typer.echo(order_cells(limit, destination))
+    except RuntimeError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(1)
