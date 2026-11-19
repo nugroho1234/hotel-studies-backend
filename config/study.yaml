@@ -19,4 +19,5 @@ max_spend_usd: 85
 delete_remote_datasets: true
 pilot_size: 100
 pilot_min_id: 20
+pilot_max_per_hotel: 4   # PRD/OSF say 2; raised for the early 27-hotel pilot (logged deviation)
 google_prescreen_only: true
