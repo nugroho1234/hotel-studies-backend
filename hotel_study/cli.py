@@ -96,3 +96,11 @@ def scrape_reviews_cmd(pass_: Annotated[int, typer.Option("--pass", help="1 or 2
     except (RuntimeError, NotImplementedError) as e:
         typer.echo(str(e), err=True)
         raise typer.Exit(1)
+
+
+@app.command("select-reviews")
+def select_reviews_cmd(limit: Limit = None, destination: Destination = None) -> None:
+    """Pick the newest reviews_per_hotel eligible reviews per final-sample hotel (safe to rerun)."""
+    from hotel_study.selection import select_reviews
+
+    typer.echo(select_reviews(limit, destination))
