@@ -12,6 +12,7 @@ google: {top_results: 3, hl: en, gl: id, fetch_details: false, queries_per_run: 
          query_forms: [plain, name_only, prefixed], query_prefix: "hotels in ",
          usage_poll_seconds: 3, usage_max_wait_seconds: 60, usage_zero_item_wait_seconds: 10}
 name_match: {accept: 90, uncertain: 75}
+review_locale: id       # TripAdvisor domain for reviews; without it Indonesian reviews come back as English MACHINE translations
 batch_size: 10
 concurrency: 1
 end_page: null          # set by hand after the eligibility test

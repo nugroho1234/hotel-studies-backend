@@ -3,7 +3,7 @@ import pytest
 from hotel_study import reviews
 from hotel_study.reviews import build_run_input, final_sample, hotel_status, make_batches, strip_fragment
 
-CFG = {"review_window": {"start": "2023-01-01", "end": "2025-12-31"}, "languages": ["en", "id"], "batch_size": 2,
+CFG = {"review_locale": "id", "review_window": {"start": "2023-01-01", "end": "2025-12-31"}, "languages": ["en", "id"], "batch_size": 2,
        "eligibility": {"threshold": 100}, "reviews_per_hotel": 300, "max_spend_usd": 85, "delete_remote_datasets": True,
        "google": {"usage_poll_seconds": 0, "usage_max_wait_seconds": 0, "usage_zero_item_wait_seconds": 0}}
 
@@ -30,7 +30,11 @@ def test_strip_fragment():
 def test_build_run_input():
     i = build_run_input(["u1", "u2"], CFG, None)
     assert i["since"] == "2023-01-01" and i["startUrls"] == ["u1", "u2"]
-    assert not {"languages", "maxItems", "ratings", "endPage"} & set(i)
+    assert i["locale"] == "id" and not {"languages", "maxItems", "ratings", "endPage"} & set(i)
+    assert build_run_input(["u1"], CFG | {"review_locale": "xx"}, None)["locale"] == "xx"
+    bad = {k: v for k, v in CFG.items() if k != "review_locale"}
+    with pytest.raises(ValueError, match="review_locale"):
+        build_run_input(["u1"], bad, None)
     assert build_run_input(["u1"], CFG, 7)["endPage"] == 7
     with pytest.raises(ValueError):
         build_run_input(["a", "b", "c"], CFG, None)

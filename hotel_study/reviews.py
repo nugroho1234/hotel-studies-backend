@@ -56,7 +56,10 @@ def ingest_items(conn, run_id: str, items: list[dict], cfg: dict) -> dict:
 # --- scrape-reviews run loop -------------------------------------------------------------
 # Actor epctex/tripadvisor-reviews-scraper, schema read from the public Apify API (build "default").
 # Input:  startUrls (array of URL strings), since ("YYYY-MM-DD"), endPage (int, per start URL, null = no cap),
-#         plus languages / ratings / maxItems / locale which we never send.
+#         locale (TripAdvisor domain, e.g. "id"; always sent from config review_locale).
+#         languages / ratings / maxItems are never sent. Experiment on one hotel, 3 pages: no locale ->
+#         {en/en:3, id/id:3, en/id MACHINE:39}; locale="id" -> {en/en:3, id/id:42}, no MACHINE rows.
+#         `languages` stays unset (it is what produces machine translations).
 # Output: id, publishedDate, language, originalLanguage, translationType (null unless `languages` was set),
 #         location.locationId (== hotels.hotel_id), inputSource.pageNumber (1-based page that produced the item),
 #         additionalRatings = [{ratingLabel, rating}] (matches privacy.flatten_review).
@@ -87,7 +90,9 @@ def strip_fragment(url: str) -> str:
 def build_run_input(urls: list[str], cfg: dict, end_page: int | None) -> dict:
     if len(urls) > cfg["batch_size"]:
         raise ValueError(f"{len(urls)} urls exceed batch_size {cfg['batch_size']}")
-    i = {"startUrls": urls, "since": cfg["review_window"]["start"]}  # never languages / maxItems / ratings
+    if not cfg.get("review_locale"):
+        raise ValueError("review_locale is not set in config/study.yaml; without it Indonesian reviews return as machine translations")
+    i = {"startUrls": urls, "since": cfg["review_window"]["start"], "locale": cfg["review_locale"]}  # never languages / maxItems / ratings
     if end_page is not None:
         i["endPage"] = end_page
     return i
