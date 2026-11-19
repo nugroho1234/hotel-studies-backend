@@ -29,6 +29,11 @@ def split_items(items: list[dict], cfg: dict, salt: str, hotel_ids=None) -> tupl
         if r["review_id"] is None or r["hotel_id"] is None:
             log.error("skipping item without review_id/hotel_id (review id: %s)", r["review_id"])
             continue
+        try:
+            r["hotel_id"] = int(r["hotel_id"])  # the actor's locationId type is unconfirmed (int or str); DB ids are int
+        except (TypeError, ValueError):
+            log.error("skipping review %s: non-numeric location id %r", r["review_id"], r["hotel_id"])
+            continue
         if hotel_ids is not None and r["hotel_id"] not in hotel_ids:
             log.error("dropping review %s: hotel %s is not in this batch (redirected listing?)", r["review_id"], r["hotel_id"])
             continue
@@ -97,9 +102,11 @@ def strip_fragment(url: str) -> str:
     return urldefrag(url)[0]  # review_url may carry '#/chat/...'
 
 
-def build_run_input(urls: list[str], cfg: dict, end_page: int | None) -> dict:
+def build_run_input(urls: list[str], cfg: dict, end_page: int | None, eligibility_test: bool = False) -> dict:
     if len(urls) > cfg["batch_size"]:
         raise ValueError(f"{len(urls)} urls exceed batch_size {cfg['batch_size']}")
+    if end_page is None and not eligibility_test and len(urls) > cfg["no_endpage_batch_size"]:
+        raise ValueError(f"{len(urls)} urls exceed no_endpage_batch_size {cfg['no_endpage_batch_size']} for a run without endPage")
     if not cfg.get("review_locale"):
         raise ValueError("review_locale is not set in config/study.yaml; without it Indonesian reviews return as machine translations")
     i = {"startUrls": urls, "since": cfg["review_window"]["start"], "locale": cfg["review_locale"]}  # never languages / maxItems / ratings
@@ -172,7 +179,7 @@ def _succeeded(run) -> bool:
 def _attempt(client, conn, batch, cfg, pass_, end_page) -> int | None:
     """One actor run. Returns hotels updated, or None if the run did not succeed. A crash mid-way leaves the row unfinished for reconcile()."""
     check_spend(conn, cfg)
-    run_input = build_run_input([strip_fragment(h[3]) for h in batch], cfg, end_page)
+    run_input = build_run_input([strip_fragment(h[3]) for h in batch], cfg, end_page, eligibility_test=pass_ == "eligibility_test")
     run = client.actor(ACTOR).start(run_input=run_input)
     upsert(conn, "scrape_runs", [{"run_id": run.id, "actor": ACTOR, "pass": pass_, "input": run_input,  # provenance before ingest
                                   "dataset_id": run.default_dataset_id, "started_at": datetime.now(timezone.utc)}], "run_id")

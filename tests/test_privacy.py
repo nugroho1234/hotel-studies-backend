@@ -178,3 +178,19 @@ def test_duplicate_review_ids_counted_once_first_wins():
     rows, counts = split_items([item(id=1, title="first"), item(id=1, title="second"), item(id=2)], CFG, "s")
     assert [(r["review_id"], r["title"]) for r in rows] == [(1, "first"), (2, "Nice")]
     assert counts[7]["n_raw"] == 2 and counts[7]["n_eligible"] == 2
+
+
+def test_string_location_id_is_normalised(caplog):
+    rows, counts = split_items([item(id=1, location={"locationId": "7"}), item(id=2)], CFG, "s", hotel_ids={7})
+    assert [r["hotel_id"] for r in rows] == [7, 7] and counts[7]["n_raw"] == 2
+
+
+def test_non_numeric_location_id_skipped_and_logged(caplog):
+    with caplog.at_level(logging.ERROR):
+        rows, counts = split_items([item(id=5, location={"locationId": "abc"}), item(id=2)], CFG, "s", hotel_ids={7})
+    assert [r["review_id"] for r in rows] == [2] and "5" in caplog.text and "Good stay" not in caplog.text
+
+
+def test_foreign_int_and_str_ids_still_dropped():
+    rows, counts = split_items([item(id=1, location={"locationId": "99"}), item(id=2, location={"locationId": 98}), item(id=3)], CFG, "s", hotel_ids={7})
+    assert [r["review_id"] for r in rows] == [3] and set(counts) == {7}

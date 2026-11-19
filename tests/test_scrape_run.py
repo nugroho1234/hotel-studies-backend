@@ -3,7 +3,7 @@ import pytest
 from hotel_study import reviews
 from hotel_study.reviews import build_run_input, final_sample, hotel_status, make_batches, strip_fragment
 
-CFG = {"review_locale": "id", "review_window": {"start": "2023-01-01", "end": "2025-12-31"}, "languages": ["en", "id"], "batch_size": 2,
+CFG = {"review_locale": "id", "review_window": {"start": "2023-01-01", "end": "2025-12-31"}, "languages": ["en", "id"], "batch_size": 2, "no_endpage_batch_size": 1,
        "eligibility": {"threshold": 100}, "reviews_per_hotel": 300, "max_spend_usd": 85, "delete_remote_datasets": True,
        "google": {"usage_poll_seconds": 0, "usage_max_wait_seconds": 0, "usage_zero_item_wait_seconds": 0}}
 
@@ -28,7 +28,7 @@ def test_strip_fragment():
 
 
 def test_build_run_input():
-    i = build_run_input(["u1", "u2"], CFG, None)
+    i = build_run_input(["u1", "u2"], CFG, None, eligibility_test=True)
     assert i["since"] == "2023-01-01" and i["startUrls"] == ["u1", "u2"]
     assert i["locale"] == "id" and not {"languages", "maxItems", "ratings", "endPage"} & set(i)
     assert build_run_input(["u1"], CFG | {"review_locale": "xx"}, None)["locale"] == "xx"
@@ -344,3 +344,10 @@ def test_no_endpage_smaller_run_keeps_stored_row(caplog):
 def test_missing_page_number_is_not_complete():
     ev = _uh(None, 150, 41, items=[{"id": 1, "location": {"locationId": 1}}])
     assert ev[0][5] == "needs_pass2"
+
+
+def test_no_endpage_batch_guard():
+    with pytest.raises(ValueError, match="no_endpage_batch_size"):
+        build_run_input(["u1", "u2"], CFG, None)
+    assert build_run_input(["u1", "u2"], CFG, None, eligibility_test=True)["startUrls"] == ["u1", "u2"]
+    assert build_run_input(["u1", "u2"], CFG, 7)["endPage"] == 7
