@@ -253,7 +253,7 @@ URL = "https://x/Hotel_Review-g1-d1-Reviews-A.html"
 
 def test_reconcile_succeeded_unfinished_ingests_stored_dataset(env, monkeypatch):
     client = Client([item(1, 1)], events=env)
-    conn = Conn(env, unfinished=[("runX", "ds-runX", {"startUrls": [URL]})], todo=[1])
+    conn = Conn(env, unfinished=[("runX", "ds-runX", {"startUrls": [URL]}, reviews.ACTOR)], todo=[1])
     _reconcile_env(env, monkeypatch, client, conn)
     assert client.starts == 0 and "ingest" in env and len(hotel_events(env)) == 1
     assert client.deleted == ["ds-runX"] and env.rows[-1]["run_id"] == "runX" and "finished_at" in env.rows[-1]
@@ -262,7 +262,7 @@ def test_reconcile_succeeded_unfinished_ingests_stored_dataset(env, monkeypatch)
 def test_reconcile_failed_unfinished_deletes_dataset_and_finishes(env, monkeypatch):
     client = Client([], events=env, usage=0.0)
     client.get_status = "FAILED"
-    conn = Conn(env, unfinished=[("runX", "ds-runX", {"startUrls": [URL]})])
+    conn = Conn(env, unfinished=[("runX", "ds-runX", {"startUrls": [URL]}, reviews.ACTOR)])
     _reconcile_env(env, monkeypatch, client, conn)
     assert client.starts == 0 and "ingest" not in env and client.deleted == ["ds-runX"] and "finished_at" in env.rows[-1]
 
@@ -270,8 +270,8 @@ def test_reconcile_failed_unfinished_deletes_dataset_and_finishes(env, monkeypat
 def test_reconcile_failure_aborts_without_new_run(env, monkeypatch):
     client = Client([], events=env)
     client.get_fail = True
-    conn = Conn(env, hotels=[(1, "S", 3, URL)], unfinished=[("runX", "ds-runX", {})])
-    with pytest.raises(RuntimeError, match="reconcile"):
+    conn = Conn(env, hotels=[(1, "S", 3, URL)], unfinished=[("runX", "ds-runX", {}, reviews.ACTOR)])
+    with pytest.raises(RuntimeError, match=r"update scrape_runs set finished_at = now\(\), usage_usd = .*where run_id = .runX."):
         _reconcile_env(env, monkeypatch, client, conn)
     assert client.starts == 0
 
@@ -285,3 +285,20 @@ def test_check_spend_refuses_unfinished_row():
 
     with pytest.raises(SpendLimitReached, match="abc"):
         check_spend(C(), {"max_spend_usd": 85})
+
+
+def test_reconcile_google_row_closed_without_ingest(env, monkeypatch):
+    client = Client([item(1, 1)], events=env)
+    conn = Conn(env, unfinished=[("g1", "ds-g1", {"queries": ["q"]}, "s-r/free-google-hotels-scraper")], todo=[1])
+    _reconcile_env(env, monkeypatch, client, conn)
+    assert client.starts == 0 and "ingest" not in env and "fetch" not in env
+    assert client.deleted == ["ds-g1"] and env.rows[-1]["actor"] == "s-r/free-google-hotels-scraper" and "finished_at" in env.rows[-1]
+
+
+def test_reconcile_google_row_unfetchable_aborts_with_hint(env, monkeypatch):
+    client = Client([], events=env)
+    client.get_fail = True
+    conn = Conn(env, unfinished=[("g1", "ds-g1", {}, "s-r/free-google-hotels-scraper")])
+    with pytest.raises(RuntimeError, match="where run_id = 'g1'"):
+        _reconcile_env(env, monkeypatch, client, conn)
+    assert client.starts == 0

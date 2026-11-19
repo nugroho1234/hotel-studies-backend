@@ -128,11 +128,11 @@ def _update_hotels(conn, run_id, items, ids, cfg, end_page) -> int:
     return n
 
 
-def _finish(client, conn, run, n_items: int, cfg: dict, delete: bool) -> None:
+def _finish(client, conn, run, n_items: int, cfg: dict, delete: bool, actor: str = ACTOR) -> None:
     """Record finished_at / item_count / usage_usd, then delete the remote dataset per config (privacy)."""
     g = cfg["google"]
     run, usage = _wait_for_usage(client, run, g["usage_max_wait_seconds"], g["usage_poll_seconds"])
-    row = {"run_id": run.id, "actor": ACTOR, "finished_at": datetime.now(timezone.utc), "item_count": n_items}
+    row = {"run_id": run.id, "actor": actor, "finished_at": datetime.now(timezone.utc), "item_count": n_items}
     if usage is not None and (usage > 0 or not n_items):
         row["usage_usd"] = usage  # left NULL if unconfirmed: check_spend then refuses further runs
     upsert(conn, "scrape_runs", [row], "run_id")
@@ -185,8 +185,8 @@ def run_batch(client, conn, batch, cfg, pass_, end_page) -> int | None:
 def reconcile(client, conn, cfg: dict) -> int:
     """Settle scrape_runs rows left unfinished by a crash: record usage, ingest a succeeded run's stored dataset
     (never start a new run), delete datasets per config. Raises RuntimeError if anything cannot be settled."""
-    rows = conn.execute("SELECT run_id, dataset_id, input FROM scrape_runs WHERE finished_at IS NULL AND actor = %s", (ACTOR,)).fetchall()
-    for run_id, dataset_id, inp in rows:
+    rows = conn.execute("SELECT run_id, dataset_id, input, actor FROM scrape_runs WHERE finished_at IS NULL").fetchall()
+    for run_id, dataset_id, inp, actor in rows:
         try:
             run = client.run(run_id).get()
             if run is None:
@@ -195,16 +195,18 @@ def reconcile(client, conn, cfg: dict) -> int:
             if status in ("READY", "RUNNING"):
                 raise RuntimeError(f"still {status}; wait for it to end")
             items, delete = [], True
-            if status == "SUCCEEDED":
+            if status == "SUCCEEDED" and actor == ACTOR:  # other actors (google) are only closed out, never ingested here
                 inp = inp or {}
                 ids = [i for i in (parse_hotel_id(u) for u in inp.get("startUrls", [])) if i]
                 todo = [r[0] for r in conn.execute("SELECT hotel_id FROM hotels WHERE hotel_id = ANY(%s) AND scrape_status = 'not_scraped'", (ids,)).fetchall()]
                 if todo:
                     items = list(client.dataset(dataset_id).iterate_items())
                     _update_hotels(conn, run_id, items, todo, cfg, inp.get("endPage"))
-            _finish(client, conn, run, len(items), cfg, delete)
+            _finish(client, conn, run, len(items), cfg, delete, actor)
         except (RuntimeError, ApifyApiError, OSError) as e:
-            raise RuntimeError(f"Could not reconcile unfinished run {run_id}: {e}. No new runs started; fix and rerun.") from e
+            raise RuntimeError(f"Could not reconcile unfinished run {run_id}: {e}. No new runs started. Manual way out: "
+                               f"update scrape_runs set finished_at = now(), usage_usd = <value from the Apify console> where run_id = '{run_id}'. "
+                               "If it SUCCEEDED but its dataset expired, its hotels stay not_scraped and will be re-scraped (costs money).") from e
     return len(rows)
 
 
