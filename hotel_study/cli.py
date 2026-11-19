@@ -85,7 +85,7 @@ def order_cells_cmd(limit: Annotated[int | None, typer.Option("--limit", help="O
 
 
 @app.command("scrape-reviews")
-def scrape_reviews_cmd(pass_: Annotated[int, typer.Option("--pass", help="1 or 2")] = 1,
+def scrape_reviews_cmd(pass_: Annotated[int, typer.Option("--pass", help="1 (main pass; --limit = at most N cells) or 2")] = 1,
                        eligibility_test: Annotated[bool, typer.Option("--eligibility-test", help="Scrape only the first hotels of each cell, no page cap")] = False,
                        limit: Limit = None, destination: Destination = None) -> None:
     """Scrape TripAdvisor reviews (resumable; reruns never duplicate reviews)."""

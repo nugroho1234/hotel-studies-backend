@@ -9,6 +9,7 @@ from apify_client.errors import ApifyApiError
 
 from hotel_study import db
 from hotel_study.db import upsert
+from hotel_study.cells import cell_done, next_batch_size
 from hotel_study.cli import same_destination
 from hotel_study.config import get_secret, load_config, require_main_pass_ready
 from hotel_study.google import SpendLimitReached, _wait_for_usage, check_spend
@@ -203,7 +204,7 @@ def reconcile(client, conn, cfg: dict) -> int:
             if status == "SUCCEEDED" and actor == ACTOR:  # other actors (google) are only closed out, never ingested here
                 inp = inp or {}
                 ids = [i for i in (parse_hotel_id(u) for u in inp.get("startUrls", [])) if i]
-                todo = [r[0] for r in conn.execute("SELECT hotel_id FROM hotels WHERE hotel_id = ANY(%s) AND scrape_status = 'not_scraped'", (ids,)).fetchall()]
+                todo = [r[0] for r in conn.execute("SELECT hotel_id FROM hotels WHERE hotel_id = ANY(%s) AND scrape_status IN ('not_scraped', 'needs_pass2')", (ids,)).fetchall()]
                 if todo:
                     items = list(client.dataset(dataset_id).iterate_items())
                     _update_hotels(conn, run_id, items, todo, cfg, inp.get("endPage"))
@@ -215,18 +216,86 @@ def reconcile(client, conn, cfg: dict) -> int:
     return len(rows)
 
 
+def _spent(conn) -> float:
+    return conn.execute("SELECT coalesce(sum(usage_usd), 0) FROM scrape_runs").fetchone()[0]
+
+
+def _cell_rows(conn, cell):
+    """[(hotel_id, url, scrape_status, is_eligible, in_eligibility_test)] in cell_order."""
+    return conn.execute("SELECT hotel_id, review_url, scrape_status, is_eligible, in_eligibility_test FROM hotels "
+                        "WHERE destination = %s AND final_star_rating = %s AND cell_order IS NOT NULL ORDER BY cell_order", cell).fetchall()
+
+
+def _run(client, conn, cell, rows, pass_, end_page, cfg) -> None:
+    batch = [(r[0], cell[0], cell[1], r[1]) for r in rows]
+    n = run_batch(client, conn, batch, cfg, pass_, end_page)
+    left = [h[0] for h in batch if (n is None) or h[0] in {r[0] for r in _cell_rows(conn, cell) if r[2] == "not_scraped"}]
+    if left:
+        raise RuntimeError(f"cell {cell}: hotels {left} not scraped (run failed or returned no reviews); rerun scrape-reviews --pass 1 to retry")
+    print(f"cell {cell} pass {pass_}: hotels {[h[0] for h in batch]} done, spent ${_spent(conn):.2f}")
+
+
+def scrape_cell(client, conn, cell: tuple, cfg: dict) -> int:
+    """PRD section 8 main pass 1 for one cell. Returns the cell's eligible hotel count.
+    Undecided hotels (needs_pass2, <threshold) are re-scraped without endPage first, even when the ceiling is already met,
+    because a decided-eligible early hotel can displace a later one in the final sample."""
+    ceiling, size = cfg["ceiling"], cfg["batch_size"]
+    while True:
+        rows = _cell_rows(conn, cell)
+        undecided = [r for r in rows if r[2] == "needs_pass2" and r[3] is None]
+        if undecided:
+            _run(client, conn, cell, undecided[:size], "2", None, cfg)
+            continue
+        n_elig = sum(r[3] is True for r in rows)
+        todo = [r for r in rows if r[2] == "not_scraped"]
+        if cell_done(n_elig, ceiling) or not todo:
+            break
+        tested = [r for r in rows if r[4] and r[2] != "not_scraped"]
+        share = sum(r[3] is True for r in tested) / len(tested) if tested else 0.0  # eligibility-test eligible / scraped
+        k = next_batch_size(ceiling - n_elig, share, size, len(todo))  # only reached with needed > 0 and remaining > 0
+        _run(client, conn, cell, todo[:k], "1", cfg["end_page"], cfg)
+    conn.execute("UPDATE hotels SET scrape_status = 'not_needed' WHERE destination = %s AND final_star_rating = %s AND scrape_status = 'not_scraped'", cell)
+    keep = [r[0] for r in rows if r[3] is True][:ceiling]
+    conn.execute("UPDATE hotels SET in_final_sample = (hotel_id = ANY(%s)) WHERE destination = %s AND final_star_rating = %s", (keep, *cell))
+    conn.commit()
+    print(f"cell {cell} finished: {n_elig} eligible, {len(keep)} in final sample, spent ${_spent(conn):.2f}")
+    return n_elig
+
+
+def scrape_pass2(client, conn, cfg: dict, limit: int | None = None, destination: str | None = None) -> str:
+    """Re-scrape final-sample hotels that hit endPage with >=threshold eligible reviews, with no endPage."""
+    if conn.execute("SELECT 1 FROM hotels WHERE cell_order IS NOT NULL AND scrape_status = 'not_scraped' LIMIT 1").fetchone():
+        raise RuntimeError("pass 2 refused: some cells still have not_scraped hotels; finish scrape-reviews --pass 1 first")
+    rows = conn.execute("SELECT hotel_id, destination, final_star_rating, review_url FROM hotels "
+                        "WHERE in_final_sample AND scrape_status = 'needs_pass2' ORDER BY destination, final_star_rating, cell_order").fetchall()
+    hotels = [r for r in rows if same_destination(r[1] or "", destination)][:limit]
+    done = failed = 0
+    for b in make_batches(hotels, cfg["batch_size"]):
+        n = run_batch(client, conn, b, cfg, "2", None)
+        if n is None:
+            failed += len(b)
+        else:
+            done += n
+            print(f"pass 2: hotels {[h[0] for h in b]} done, spent ${_spent(conn):.2f}")
+    return f"Pass 2: {done} hotels scraped, {failed} failed."
+
+
 def scrape_reviews(pass_: str, eligibility_test: bool, limit: int | None = None, destination: str | None = None, conn=None) -> str:
     cfg = load_config()
-    if not eligibility_test:
-        if pass_ == "1":
-            require_main_pass_ready(cfg)
-        raise NotImplementedError("main pass is Task 10")
+    if not eligibility_test and pass_ == "1":
+        require_main_pass_ready(cfg)
     from hotel_study.db import connect
     own = conn is None
     conn = conn or connect()
     try:
         client = ApifyClient(get_secret("APIFY_TOKEN"))
         reconcile(client, conn, cfg)
+        if not eligibility_test and pass_ == "2":
+            return scrape_pass2(client, conn, cfg, limit, destination)
+        if not eligibility_test:  # --limit = at most N cells; completed cells are only finalised, never re-scraped
+            cells = [tuple(c) for c in conn.execute("SELECT DISTINCT destination, final_star_rating FROM hotels WHERE cell_order IS NOT NULL "
+                                                    "ORDER BY destination, final_star_rating").fetchall() if same_destination(c[0] or "", destination)][:limit]
+            return f"Main pass 1: {len(cells)} cells, eligible per cell: " + ", ".join(f"{c[0]}/{c[1]}={scrape_cell(client, conn, c, cfg)}" for c in cells)
         # resume: only hotels still not_scraped; eligibility-test hotels have cell_order <= eligibility_test_size
         rows = conn.execute("SELECT hotel_id, destination, final_star_rating, review_url FROM hotels "
                             "WHERE in_eligibility_test AND scrape_status = 'not_scraped' "
