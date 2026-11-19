@@ -93,7 +93,7 @@ def test_split_items_counts_and_flags(caplog):
         rows, counts = split_items(items, CFG, "s")
     assert [r["review_id"] for r in rows] == [1, 4, 5]
     assert [r["lang_ok"] for r in rows] == [True, False, False]
-    assert counts[7] == {"n_raw": 5, "n_out_of_window": 2, "n_other_language": 2, "n_eligible": 1}
+    assert counts[7] == {"n_raw": 5, "n_out_of_window": 2, "n_other_language": 2, "n_eligible": 1, "n_bad_date": 0}
     assert "translation_type" in caplog.text
 
 
@@ -105,3 +105,29 @@ def test_ingest_items_thin_write(monkeypatch):
     assert out[7]["n_out_of_window"] == 1
     (_, table, rows, key), = calls
     assert table == "reviews" and key == "review_id" and rows[0]["scrape_run_id"] == "run1" and len(rows) == 1
+
+
+def _own(s, **o):
+    return flatten_review(item(ownerResponse={"text": s, **o}), "s")["owner_response_text"]
+
+
+def test_closing_phrase_must_be_whole_line():
+    assert _own("Terima kasih atas ulasan Anda.") == "Terima kasih atas ulasan Anda."
+    assert _own("Terima kasih,\nMade\nGuest Relations") == ""
+    assert _own("Thanks.\nTerima kasih,\nMade\nGuest Relations") == "Thanks."
+    t = "Salam hangat dari kami di Bali, semoga kembali.\nKami tunggu.\nSampai jumpa."
+    assert _own(t) == t
+    assert _own("Thanks.\nSalam\nMade\n\n\n") == "Thanks."  # trailing blank lines ignored
+
+
+def test_name_word_boundaries():
+    assert _own("We made it homemade. Made says hi.", responder="Made") == "We  it homemade.  says hi."  # case-insensitive, whole word only
+    assert _own("Hi Al", responder="Al") == "Hi Al"  # names under 3 chars skipped
+
+
+def test_malformed_items_skipped_and_logged(caplog):
+    with caplog.at_level(logging.ERROR):
+        rows, counts = split_items([item(id=None), item(location={}), item(id=8, publishedDate=None), item(id=9)], CFG, "s")
+    assert [r["review_id"] for r in rows] == [9]
+    assert None not in counts and counts[7]["n_bad_date"] == 1 and counts[7]["n_out_of_window"] == 0
+    assert counts[7]["n_raw"] == 2

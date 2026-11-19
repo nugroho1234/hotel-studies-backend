@@ -3,8 +3,8 @@ import re
 from datetime import date
 
 SUBRATINGS = {"value", "rooms", "location", "cleanliness", "service", "sleep quality"}
-CLOSINGS = ("best regards", "warm regards", "kind regards", "regards", "sincerely", "salam",
-            "hormat kami", "terima kasih")
+CLOSINGS = {"best regards", "warm regards", "kind regards", "regards", "sincerely", "salam",
+            "hormat kami", "terima kasih"}
 
 
 def hash_user_id(user_id: str, salt: str) -> str:
@@ -32,11 +32,12 @@ def _clean_owner_text(text, own_names):
     if not text:
         return text
     for n in own_names:
-        if isinstance(n, str) and n.strip():
-            text = re.sub(re.escape(n.strip()), "", text, flags=re.I)
-    lines = text.split("\n")
-    for i in range(max(0, len(lines) - 3), len(lines)):
-        if lines[i].strip().lower().startswith(CLOSINGS):
+        if isinstance(n, str) and len(n.strip()) >= 3:
+            text = re.sub(rf"\b{re.escape(n.strip())}\b", "", text, flags=re.I)
+    lines = text.rstrip().split("\n")
+    filled = [i for i, l in enumerate(lines) if l.strip()]
+    for i in filled[-3:]:  # the closing phrase must be the whole line, not a sentence starting with it
+        if lines[i].strip(" \t,.!:;-").lower() in CLOSINGS:
             return "\n".join(lines[:i]).rstrip()
     return text
 

@@ -11,12 +11,19 @@ log = logging.getLogger(__name__)
 def split_items(items: list[dict], cfg: dict, salt: str) -> tuple[list[dict], dict]:
     """Pure: flatten, drop out-of-window, set lang_ok, count per hotel."""
     w, langs = cfg["review_window"], cfg["languages"]
-    rows, counts = [], defaultdict(lambda: dict.fromkeys(("n_raw", "n_out_of_window", "n_other_language", "n_eligible"), 0))
+    rows, counts = [], defaultdict(lambda: dict.fromkeys(("n_raw", "n_out_of_window", "n_other_language", "n_eligible", "n_bad_date"), 0))
     for it in items:
         r = flatten_review(it, salt)  # raw item is never kept or written
+        if r["review_id"] is None or r["hotel_id"] is None:
+            log.error("skipping item without review_id/hotel_id (review id: %s)", r["review_id"])
+            continue
         c = counts[r["hotel_id"]]
         c["n_raw"] += 1
-        if not in_window(str(it.get("publishedDate")), w["start"], w["end"]):
+        if r["published_date"] is None:
+            log.error("review %s has a missing or unparsable publishedDate", r["review_id"])
+            c["n_bad_date"] += 1
+            continue
+        if not in_window(r["published_date"].isoformat(), w["start"], w["end"]):
             c["n_out_of_window"] += 1
             continue
         if r["translation_type"] is not None:
