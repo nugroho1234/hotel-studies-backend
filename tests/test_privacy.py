@@ -247,3 +247,26 @@ def test_scrub_handles_emails_and_longer_closings():
     assert scrub("See you.\nBest Regards, Sintia\u2013 Guest Relation Officer.") == "See you."
     assert scrub("Om Swastiastu, Nomad19077435611,\nThanks.") == "Om Swastiastu, [name],\nThanks."
     assert scrub("Write to me at yuni.maharani@x.com now.") == "Write to me at [email] now."
+
+
+def test_scrub_opening_salutation_is_not_a_closing():
+    body = "Dear Our Beloved Guest,\n\nSalam hangat dari !\nTerima kasih telah meluangkan waktu untuk berbagi pengalaman Anda dengan kami yang sangat berharga.\nKami tunggu kedatangan Anda kembali di hotel kami pada kesempatan berikutnya."
+    assert scrub(body) == body
+    assert scrub(body + "\n\nSalam Hangat\nManagement") == body
+
+
+def test_scrub_is_idempotent():
+    t = "Dear patrak2024,\nThanks a lot for your kind words about our staff.\nWarmest regards,\nDewi Lestari\nGuest Relations Manager"
+    assert scrub(scrub(t)) == scrub(t)
+
+
+def test_scrub_keeps_japanese_text_without_ascii_sentence_ends():
+    t = "レビューをありがとうございます。\n\nまたのお越しをお待ちしております。\n\n敬具、\n\nBagus Teja\nCorporate General Manager"
+    out = scrub(t)
+    assert out.startswith("レビューをありがとうございます。") and "お待ちしております" in out and "Bagus" not in out
+
+
+def test_scrub_greeting_without_comma_never_eats_the_body():
+    assert scrub("Dear tylerlM5959DP Thank you so much for the thoughtful review.") == "Dear [name] Thank you so much for the thoughtful review."
+    assert scrub("Dear Valued Guest Thank you for staying.") == "Dear Valued Guest Thank you for staying."
+    assert scrub("Dear Mr. Smith Thank you for staying with us.") == "Dear Mr. [name] Thank you for staying with us."
