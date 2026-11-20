@@ -23,3 +23,8 @@ def require_main_pass_ready(cfg: dict) -> None:
     missing = [k for k in ("ceiling", "end_page") if cfg.get(k) is None]
     if missing:
         raise RuntimeError(f"Set {', '.join(missing)} in config/study.yaml before the main pass")
+
+
+def require_flag(cfg: dict, name: str) -> None:
+    if cfg.get(name) is not True:
+        raise RuntimeError(f"{name} is false in config/study.yaml; it stays false until the owner confirms (ethics amendment / price go-ahead)")

@@ -222,3 +222,13 @@ def test_match_note_reasons():
     assert _note(h | {"google_match_score": 80.0}, 90) == "score below 90"
     assert _note(h | {"google_name": None}, 90) == "no google hit"
     assert _note(h | {"star_check_status": "needs_manual_check"}, 90) == ""
+
+
+def test_plan_finalise_sets_exclusion_reason_only_for_disagree():
+    hotels = {1: hotel(google_star_rating=5, star_check_status="needs_manual_check"),
+              2: hotel(google_star_rating=5, star_check_status="needs_manual_check")}
+    csv = [dict(hotel_id="1", match_confirmed="", manual_google_star="", ta_displayed_class="3"),   # TA says 3.0, Google 5 -> disagree
+           dict(hotel_id="2", match_confirmed="", manual_google_star="", ta_displayed_class="4.5")]  # 4.5 -> agree_half_star
+    out = {u["hotel_id"]: u for u in plan_finalise(csv, hotels, set(hotels), T)}
+    assert out[1]["star_check_status"] == "disagree" and out[1]["exclusion_reason"] == "star_disagree"
+    assert out[2]["exclusion_reason"] is None

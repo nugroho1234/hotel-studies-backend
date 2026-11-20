@@ -25,6 +25,17 @@ pilot_size: 100
 pilot_min_id: 20
 pilot_max_per_hotel: 2   # registered value (PRD/OSF); the early-pilot cap of 4 was dropped when the owner chose to wait for the main pass
 google_prescreen_only: true
+# Papers 2-3 flags: all false keeps the pipeline exactly as preregistered for Paper 1
+allow_extended_collection: false   # gates stays after 2025-12-31, >300 reviews/hotel, hotels beyond the ceiling, incremental runs
+allow_price_collection: false      # gates scheduled monthly price runs (test mode with 3-5 hotels is allowed)
+run_rating_feasibility: false      # gates rating-based feasibility measures on Paper 1 hotels
+min_reviews_per_window: 30
+prices:
+  max_spend_usd: 10
+  currency: USD
+  weekend_checkin_weekdays: [4, 5]   # Mon=0; Friday and Saturday check-in = weekend
+  schedule: {start: "2026-12-01", end: "2027-12-01", day_of_month: 1}
+validation: {dev_size: 70, test_size: 130}
 subrating_labels:   # ratingLabel text per subrating column (locale en and id), matched case-insensitively
   value: [Value, Nilai]
   rooms: [Rooms, Kamar]

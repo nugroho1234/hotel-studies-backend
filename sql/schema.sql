@@ -95,3 +95,112 @@ CREATE TABLE IF NOT EXISTS reviews (
 CREATE INDEX IF NOT EXISTS reviews_hotel_date_idx ON reviews (hotel_id, published_date DESC, review_id DESC);
 CREATE INDEX IF NOT EXISTS reviews_selected_idx ON reviews (hotel_id) WHERE is_selected;
 CREATE UNIQUE INDEX IF NOT EXISTS reviews_selection_rank_uq ON reviews (hotel_id, selection_rank) WHERE selection_rank IS NOT NULL;
+
+-- ===== Papers 2-3 extension (additive; nothing dropped; safe to rerun) =====
+ALTER TABLE hotels ADD COLUMN IF NOT EXISTS google_entity_id text;
+ALTER TABLE hotels ADD COLUMN IF NOT EXISTS google_kg_id text;
+ALTER TABLE hotels ADD COLUMN IF NOT EXISTS exclusion_reason text;
+ALTER TABLE hotels DROP CONSTRAINT IF EXISTS hotels_exclusion_reason_check;
+ALTER TABLE hotels ADD CONSTRAINT hotels_exclusion_reason_check
+  CHECK (exclusion_reason IN ('star_disagree','closed','not_a_hotel'));
+ALTER TABLE hotels ADD COLUMN IF NOT EXISTS brand_or_chain text;
+ALTER TABLE hotels ADD COLUMN IF NOT EXISTS room_count integer;
+ALTER TABLE hotels ADD COLUMN IF NOT EXISTS amenities jsonb;
+ALTER TABLE hotels ADD COLUMN IF NOT EXISTS latitude numeric(9,6);
+ALTER TABLE hotels ADD COLUMN IF NOT EXISTS longitude numeric(9,6);
+
+ALTER TABLE reviews ADD COLUMN IF NOT EXISTS stay_month_only boolean NOT NULL DEFAULT true;
+ALTER TABLE reviews ADD COLUMN IF NOT EXISTS source_actor text;
+ALTER TABLE reviews ADD COLUMN IF NOT EXISTS in_paper1_sample boolean GENERATED ALWAYS AS (is_selected) STORED;
+
+ALTER TABLE scrape_runs DROP CONSTRAINT IF EXISTS scrape_runs_pass_check;
+ALTER TABLE scrape_runs ADD CONSTRAINT scrape_runs_pass_check
+  CHECK (pass IN ('google','eligibility_test','1','2','incremental','prices'));
+ALTER TABLE scrape_runs ADD COLUMN IF NOT EXISTS status text;
+ALTER TABLE scrape_runs ADD COLUMN IF NOT EXISTS error text;
+
+CREATE OR REPLACE VIEW hotels_v AS
+SELECT h.*,
+  h.star_class AS tripadvisor_class,
+  h.google_star_rating AS google_class,
+  h.cell_order AS draw_order,
+  CASE WHEN h.exclusion_reason IS NOT NULL THEN 'excluded'
+       WHEN h.scrape_status = 'not_needed' THEN 'not_needed'
+       WHEN h.is_eligible IS TRUE THEN 'eligible'
+       WHEN h.is_eligible IS FALSE THEN 'ineligible'
+       ELSE 'pending' END AS eligibility_status
+FROM hotels h;
+
+CREATE TABLE IF NOT EXISTS prices (
+  price_id bigserial PRIMARY KEY,
+  hotel_id bigint NOT NULL REFERENCES hotels(hotel_id) ON DELETE RESTRICT,
+  collection_run_id text NOT NULL REFERENCES scrape_runs(run_id),
+  collected_at timestamptz NOT NULL DEFAULT now(),
+  checkin_date date NOT NULL,
+  checkout_date date NOT NULL,
+  nights smallint,
+  lead_days integer,
+  day_type text CHECK (day_type IN ('weekday','weekend')),
+  price_usd numeric(12,2),
+  has_decimals boolean,
+  status text CHECK (status IN ('ok','sold_out','missing')),
+  raw_json jsonb,
+  UNIQUE (collection_run_id, hotel_id, checkin_date, checkout_date)
+);
+CREATE INDEX IF NOT EXISTS prices_hotel_checkin_idx ON prices (hotel_id, checkin_date);
+
+CREATE TABLE IF NOT EXISTS review_windows (
+  hotel_id bigint NOT NULL REFERENCES hotels(hotel_id) ON DELETE RESTRICT,
+  window_end_month date NOT NULL,
+  review_count integer CHECK (review_count >= 0),
+  pos_rate_tangibles real,
+  neg_rate_tangibles real,
+  pos_rate_reliability real,
+  neg_rate_reliability real,
+  pos_rate_responsiveness real,
+  neg_rate_responsiveness real,
+  pos_rate_assurance real,
+  neg_rate_assurance real,
+  pos_rate_empathy real,
+  neg_rate_empathy real,
+  PRIMARY KEY (hotel_id, window_end_month)
+);
+
+CREATE TABLE IF NOT EXISTS codebook_versions (
+  version text PRIMARY KEY,
+  created_on date,
+  sha256 text,
+  change_log text
+);
+
+CREATE TABLE IF NOT EXISTS prompt_versions (
+  prompt_version text PRIMARY KEY,
+  codebook_version text REFERENCES codebook_versions(version),
+  prompt_sha256 text,
+  frozen_at timestamptz
+);
+
+CREATE TABLE IF NOT EXISTS llm_phrase_codes (
+  phrase_id bigserial PRIMARY KEY,
+  review_id bigint NOT NULL REFERENCES reviews(review_id) ON DELETE RESTRICT,
+  run_id text,
+  span_start integer,
+  span_end integer,
+  rewritten_unit text,
+  target text,
+  sentiment text,
+  model_name text NOT NULL,
+  model_version text NOT NULL,
+  params jsonb NOT NULL,
+  prompt_version text REFERENCES prompt_versions(prompt_version),
+  coded_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS llm_phrase_codes_review_idx ON llm_phrase_codes (review_id);
+
+CREATE TABLE IF NOT EXISTS validation_split (
+  review_id bigint PRIMARY KEY REFERENCES reviews(review_id) ON DELETE RESTRICT,
+  split text CHECK (split IN ('training','dev','test')),
+  stratum text,
+  seed integer,
+  assigned_at timestamptz NOT NULL DEFAULT now()
+);

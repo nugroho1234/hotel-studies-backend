@@ -109,7 +109,8 @@ def plan_finalise(csv_rows: list[dict], hotels: dict[int, dict], all_ids: set[in
         except ValueError as e:
             errors.append((i, str(e)))
             continue
-        updates.append({"hotel_id": i, "star_check_status": st, "final_star_rating": final, "star_diff": diff, "ta_displayed_class": ta})
+        updates.append({"hotel_id": i, "star_check_status": st, "final_star_rating": final, "star_diff": diff, "ta_displayed_class": ta,
+                        "exclusion_reason": "star_disagree" if st == "disagree" else None})
     if errors:
         raise OpenManualChecks(errors)
     return updates
@@ -190,7 +191,8 @@ def finalise_stars(csv_path: Path, limit: int | None = None, destination: str | 
         updates = plan_finalise(csv_rows, hotels, all_ids, accept, check_unchecked=not (limit or destination))  # raises before any write
         with conn.cursor() as c:
             c.executemany("UPDATE hotels SET star_check_status=%(star_check_status)s, final_star_rating=%(final_star_rating)s, "
-                          "star_diff=%(star_diff)s, ta_displayed_class=%(ta_displayed_class)s WHERE hotel_id=%(hotel_id)s", updates)
+                          "star_diff=%(star_diff)s, ta_displayed_class=%(ta_displayed_class)s, "
+                          "exclusion_reason=COALESCE(%(exclusion_reason)s, exclusion_reason) WHERE hotel_id=%(hotel_id)s", updates)
             c.execute("UPDATE hotels SET in_sample_frame = (final_star_rating IS NOT NULL) WHERE hotel_id = ANY(%s)", [list(hotels)])
         conn.commit()
     return {"hotels": len(hotels), "resolved": len(updates)}
