@@ -46,6 +46,30 @@ def google_stars(limit: Limit = None, destination: Destination = None) -> None:
     typer.echo(run_google_stars(limit, destination))
 
 
+@app.command("backfill-google-ids")
+def backfill_google_ids_cmd(limit: Limit = None, destination: Destination = None) -> None:
+    """Fill hotels.google_entity_id / google_kg_id from stored google_detail_url (no Apify call)."""
+    from hotel_study.google_ids import backfill_google_ids
+
+    typer.echo(backfill_google_ids(limit, destination))
+
+
+@app.command("google-ids-export")
+def google_ids_export(path: Path = Path("output/google_ids_missing.csv")) -> None:
+    """Write final-sample hotels without a Google entity ID to a CSV for manual lookup."""
+    from hotel_study.google_ids import export_missing
+
+    typer.echo(f"{export_missing(path)} hotels written to {path}")
+
+
+@app.command("google-ids-import")
+def google_ids_import(csv: Path) -> None:
+    """Read google_travel_url per hotel from the CSV and store the entity ID."""
+    from hotel_study.google_ids import import_urls
+
+    typer.echo(import_urls(csv))
+
+
 @app.command("compare-stars")
 def compare_stars_cmd(limit: Limit = None, destination: Destination = None,
                       overwrite: Annotated[bool, typer.Option("--overwrite", help="Replace manual_checks.csv even if it holds manual entries")] = False) -> None:
@@ -117,6 +141,14 @@ def pilot_sample_cmd(force: Annotated[bool, typer.Option("--force", help="Redraw
     except RuntimeError as e:
         typer.echo(str(e), err=True)
         raise typer.Exit(1)
+
+
+@app.command("pilot-export")
+def pilot_export_cmd() -> None:
+    """Fill the pilot_sample table (randomised pilot_id) and write pilot_sample.csv and pilot_coding.csv."""
+    from hotel_study.pilot import pilot_export
+
+    typer.echo(pilot_export())
 
 
 @app.command("report")

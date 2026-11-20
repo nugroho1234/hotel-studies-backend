@@ -133,3 +133,27 @@ def pilot_sample(force: bool = False, limit: int | None = None, destination: str
     finally:
         if own:
             conn.close()
+
+
+def pilot_export(out_dir: Path | None = None) -> str:
+    """Rebuild table pilot_sample (pilot_id randomised with the study seed; review_id references reviews) and write the coder CSVs."""
+    cfg = load_config()
+    out = out_dir or ROOT / "output"
+    with connect() as conn:
+        rows = conn.execute("SELECT r.review_id, r.pilot_stratum, h.hotel_id, h.hotel_name, h.destination, h.final_star_rating, r.published_date, "
+                            "r.language, r.rating, r.trip_info_trip_type, r.title, r.text FROM reviews r JOIN hotels h USING (hotel_id) "
+                            "WHERE r.is_pilot ORDER BY r.review_id").fetchall()
+        if not rows:
+            raise RuntimeError("no pilot reviews; run pilot-sample first")
+        order = list(range(len(rows)))
+        random.Random(cfg["seed"]).shuffle(order)  # reviews are sorted by id first, so the labels are reproducible
+        labelled = [(pid, rows[i]) for pid, i in enumerate(order, 1)]
+        conn.execute("DELETE FROM pilot_sample")
+        with conn.cursor() as cur:
+            cur.executemany("INSERT INTO pilot_sample (pilot_id, review_id, stratum) VALUES (%s, %s, %s)", [(p, r[0], r[1]) for p, r in labelled])
+        conn.commit()
+    labelled.sort()
+    cols = ["review_id", "pilot_stratum", "hotel_id", "hotel_name", "destination", "final_star_rating", "published_date", "language", "rating", "trip_type", "title", "text"]
+    pd.DataFrame([(p, *r) for p, r in labelled], columns=["pilot_id", *cols]).to_csv(out / "pilot_sample.csv", index=False)
+    pd.DataFrame([(p, r[11], r[7]) for p, r in labelled], columns=["pilot_id", "review_text", "language"]).to_csv(out / "pilot_coding.csv", index=False)
+    return f"{len(labelled)} pilot reviews: table pilot_sample, {out / 'pilot_sample.csv'}, {out / 'pilot_coding.csv'}"

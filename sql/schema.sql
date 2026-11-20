@@ -204,3 +204,11 @@ CREATE TABLE IF NOT EXISTS validation_split (
   seed integer,
   assigned_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- Pilot sample for hand-coding practice: pilot_id is the randomised label shown to the coder.
+CREATE TABLE IF NOT EXISTS pilot_sample (
+  pilot_id integer PRIMARY KEY CHECK (pilot_id >= 1),
+  review_id bigint NOT NULL UNIQUE REFERENCES reviews(review_id) ON DELETE RESTRICT,
+  stratum text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
