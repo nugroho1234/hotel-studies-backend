@@ -124,7 +124,7 @@ def test_closing_phrase_must_be_whole_line():
 
 def test_name_word_boundaries():
     assert _own("We made it homemade. Made says hi.", responder="Made") == "We  it homemade.  says hi."  # case-insensitive, whole word only
-    assert _own("Hi Al", responder="Al") == "Hi Al"  # names under 3 chars skipped
+    assert _own("Bye Al", responder="Al") == "Bye Al"  # names under 3 chars skipped
 
 
 def test_malformed_items_skipped_and_logged(caplog):
@@ -200,3 +200,50 @@ def test_negative_helpful_votes_stored_as_null():
     row = flatten_review(item(helpfulVotes=-1), "salt", CFG["subrating_labels"])
     assert row["helpful_votes"] is None
     assert flatten_review(item(helpfulVotes=0), "salt", CFG["subrating_labels"])["helpful_votes"] == 0
+
+
+from hotel_study.privacy import scrub_owner_response as scrub
+
+
+def test_scrub_cuts_signature_block_with_name_and_title():
+    t = "Thank you for staying with us.\n\nWarmest Regards,\n\nDewi Lestari\nGuest Relations Manager"
+    assert scrub(t) == "Thank you for staying with us."
+
+
+def test_scrub_cuts_indonesian_signature():
+    assert scrub("Terima kasih atas ulasannya.\nHormat saya,\nBrendan Santosa\nCluster Director of Rooms") == "Terima kasih atas ulasannya."
+
+
+def test_scrub_cuts_title_block_without_closing_phrase():
+    assert scrub("Kami tunggu kedatangan Anda kembali.\nAndi Wijaya\nFront Office Manager") == "Kami tunggu kedatangan Anda kembali."
+
+
+def test_scrub_keeps_normal_last_sentence():
+    t = "We hope to see you again.\nOur team will keep improving our breakfast."
+    assert scrub(t) == t
+
+
+def test_scrub_names_after_honorifics_and_dear():
+    assert scrub("Dear Mr. Smith John, thank you.") == "Dear Mr. [name], thank you."
+    assert scrub("Dear patrak2024, \nGreetings from X.") == "Dear [name], \nGreetings from X."
+    assert scrub("Dear AldiHizkia,\nHi") == "Dear [name],\nHi"
+    assert scrub("Yth. Bapak/Ibu Wanderer,\nTerima kasih") == "Yth. Bapak/Ibu [name],\nTerima kasih"
+    assert scrub("Dear Mrs. Sulogna\nGreetings from X.") == "Dear Mrs. [name]\nGreetings from X."  # never swallows the next line
+    assert scrub("Dear Kevin,\nThanks for your review.") == "Dear [name],\nThanks for your review."
+    assert scrub("Kepada Bapak Ahmad Fauzi, terima kasih.") == "Kepada Bapak [name], terima kasih."
+
+
+def test_scrub_leaves_generic_greetings():
+    for t in ("Dear Valued Guest,\nThanks.", "Dear Guest, thanks.", "Halo Bapak, terima kasih.", "Dear Mr. Terima kasih"):
+        assert scrub(t) == t
+
+
+def test_scrub_none_and_empty():
+    assert scrub(None) is None and scrub("") == ""
+
+
+def test_scrub_handles_emails_and_longer_closings():
+    assert scrub("Thanks.\n\nVery Best Regards,\n\nKahar Salamun") == "Thanks."
+    assert scrub("See you.\nBest Regards, Sintia\u2013 Guest Relation Officer.") == "See you."
+    assert scrub("Om Swastiastu, Nomad19077435611,\nThanks.") == "Om Swastiastu, [name],\nThanks."
+    assert scrub("Write to me at yuni.maharani@x.com now.") == "Write to me at [email] now."
