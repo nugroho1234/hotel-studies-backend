@@ -43,6 +43,11 @@ def _clean_owner_text(text, own_names):
     return text
 
 
+def _non_negative(v):
+    """The actor sends -1 for an unknown count; the table only allows >= 0, so store NULL."""
+    return v if isinstance(v, int) and v >= 0 else None
+
+
 def flatten_review(item: dict, salt: str, labels: dict | None = None) -> dict:
     """Map one raw Apify item to PRD section 4 reviews columns. PII is never copied."""
     user, owner = item.get("userProfile") or {}, item.get("ownerResponse") or {}
@@ -62,14 +67,14 @@ def flatten_review(item: dict, salt: str, labels: dict | None = None) -> dict:
         "publish_platform": item.get("publishPlatform"), "rating": item.get("rating"),
         "language": item.get("language"), "original_language": item.get("originalLanguage"),
         "translation_type": item.get("translationType"), "title": item.get("title"), "text": item.get("text"),
-        "url": item.get("url"), "helpful_votes": item.get("helpfulVotes"), "mcid": item.get("mcid"),
+        "url": item.get("url"), "helpful_votes": _non_negative(item.get("helpfulVotes")), "mcid": item.get("mcid"),
         "trip_info_stay_date": _date(trip.get("stayDate")), "trip_info_trip_type": trip.get("tripType"),
         **{f"subrating_{k}": None for k in ("value", "rooms", "location", "cleanliness", "service", "sleep_quality")},
         **sub, "subratings_other": other or None,
         "photo_count": len(item.get("photos") or []),
         "user_id_hash": hash_user_id(user["userId"], salt) if user.get("userId") else None,
         "user_hometown": user.get("hometown"),
-        "user_contribution_count": (user.get("contributionCounts") or {}).get("sumAllUgc"),
+        "user_contribution_count": _non_negative((user.get("contributionCounts") or {}).get("sumAllUgc")),
         "owner_response_id": owner.get("id"), "owner_response_published_date": _date(owner.get("publishedDate")),
         "owner_response_language": owner.get("language"),
         "owner_response_text": _clean_owner_text(owner.get("text"), [owner.get("responder"), owner.get("username")]),

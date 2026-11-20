@@ -194,3 +194,9 @@ def test_non_numeric_location_id_skipped_and_logged(caplog):
 def test_foreign_int_and_str_ids_still_dropped():
     rows, counts = split_items([item(id=1, location={"locationId": "99"}), item(id=2, location={"locationId": 98}), item(id=3)], CFG, "s", hotel_ids={7})
     assert [r["review_id"] for r in rows] == [3] and set(counts) == {7}
+
+
+def test_negative_helpful_votes_stored_as_null():
+    row = flatten_review(item(helpfulVotes=-1), "salt", CFG["subrating_labels"])
+    assert row["helpful_votes"] is None
+    assert flatten_review(item(helpfulVotes=0), "salt", CFG["subrating_labels"])["helpful_votes"] == 0
