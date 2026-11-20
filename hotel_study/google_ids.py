@@ -83,15 +83,23 @@ def export_missing(path) -> int:
     return len(rows)
 
 
+def is_no_price(remark) -> bool:
+    return isinstance(remark, str) and remark.strip().upper() in {"NO_GOOGLE_PRICE", "NO_GOOGLE_PAGE"}
+
+
 def import_urls(path) -> dict:
     """Read google_travel_url (or any google.com/travel URL) per hotel_id; store entity ID and KG ID. Bad or blank rows are counted, not errors."""
     import csv
     with open(path, newline="") as f:
         rows = list(csv.DictReader(f))
-    done, bad = 0, []
+    done, bad, no_price = 0, [], 0
     with connect() as conn:
         for r in rows:
             url = (r.get("google_travel_url") or "").strip()
+            if is_no_price(r.get("remarks")) and not extract_entity_id(url):
+                conn.execute("UPDATE hotels SET has_google_price = false WHERE hotel_id = %s", (int(r["hotel_id"]),))
+                no_price += 1
+                continue
             if not url:
                 continue
             token = extract_entity_id(url)
@@ -102,4 +110,4 @@ def import_urls(path) -> dict:
                                (token, extract_kg_id(url), int(r["hotel_id"])))
             done += cur.rowcount
         conn.commit()
-    return {"rows": len(rows), "stored": done, "unreadable_hotel_ids": bad}
+    return {"rows": len(rows), "stored": done, "marked_no_price": no_price, "unreadable_hotel_ids": bad}

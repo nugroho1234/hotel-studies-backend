@@ -49,3 +49,9 @@ def test_new_style_qs_with_leading_fields():
     url = "https://www.google.com/travel/search?q=x&qs=CAAgASgAMihDaG9Jb0pmZzc5alM0N2pBQVJvTkwyY3ZNVEZxTjNJeGF6aDZNaEFC"
     assert extract_entity_id(url) == "ChoIoJfg79jS47jAARoNL2cvMTFqN3Ixazh6MhAB"
     assert extract_kg_id(url) == "/g/11j7r1k8z2"
+
+
+def test_is_no_price():
+    from hotel_study.google_ids import is_no_price
+    assert is_no_price("NO_GOOGLE_PRICE") and is_no_price(" no_google_page ")
+    assert not is_no_price("CLOSED") and not is_no_price(None) and not is_no_price(float("nan"))
