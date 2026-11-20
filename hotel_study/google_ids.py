@@ -10,15 +10,17 @@ ENTITY_URL = "https://www.google.com/travel/hotels/entity/{}"
 
 
 def _unwrap_qs(qs: str) -> str | None:
-    """travel/search?qs=<base64 of b'2' + length byte + entity token + tail> -> the entity token, else None."""
+    """travel/search?qs=<base64 protobuf>: the entity token sits in a length-prefixed field (0x32, length, 'Ch...').
+    Search-result pages (no hotel opened) carry no token, so this returns None for them."""
     try:
         raw = base64.urlsafe_b64decode(qs + "=" * (-len(qs) % 4))
     except ValueError:
         return None
-    if len(raw) > 2 and raw[0:1] == b"2" and len(raw) >= 2 + raw[1]:
-        token = raw[2:2 + raw[1]].decode("ascii", "ignore")
-        if re.fullmatch(r"Ch[A-Za-z0-9_-]+", token):
-            return token
+    for i in range(len(raw) - 3):
+        if raw[i] == 0x32 and raw[i + 2:i + 4] == b"Ch" and i + 2 + raw[i + 1] <= len(raw):
+            token = raw[i + 2:i + 2 + raw[i + 1]].decode("ascii", "ignore")
+            if re.fullmatch(r"Ch[A-Za-z0-9_-]+", token):
+                return token
     return None
 
 
@@ -34,7 +36,7 @@ def extract_entity_id(url: str | None) -> str | None:
         return None
     if not (token and re.fullmatch(r"[A-Za-z0-9_-]+", token)):
         return None
-    return token if m else (_unwrap_qs(token) or token)
+    return token if m else _unwrap_qs(token)
 
 
 def extract_kg_id(url: str | None) -> str | None:

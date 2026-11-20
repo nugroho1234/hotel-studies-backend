@@ -10,7 +10,7 @@ def test_extract_entity_id():
 
 
 def test_extract_entity_id_from_qs_fallback():
-    assert extract_entity_id("https://www.google.com/travel/hotels?qs=ChkIabc") == "ChkIabc"
+    assert extract_entity_id("https://www.google.com/travel/hotels?qs=ChkIabc") is None  # not a wrapped token
 
 
 def test_bad_input_returns_none_never_raises():
@@ -39,3 +39,13 @@ TRAVEL = ("https://www.google.com/travel/search?qs=MidDaGtJd3RpSzVwMkpwN1Z6R2cwd
 def test_travel_search_url_with_wrapped_qs():
     assert extract_entity_id(TRAVEL) == "ChkIwtiK5p2Jp7VzGg0vZy8xMWI3M2p6ODU0EAE"
     assert extract_kg_id(TRAVEL) == "/g/11b73jz854"
+
+
+def test_search_page_without_hotel_has_no_entity_id():
+    assert extract_entity_id("https://www.google.com/travel/search?q=x&qs=CAAgASgA") is None
+
+
+def test_new_style_qs_with_leading_fields():
+    url = "https://www.google.com/travel/search?q=x&qs=CAAgASgAMihDaG9Jb0pmZzc5alM0N2pBQVJvTkwyY3ZNVEZxTjNJeGF6aDZNaEFC"
+    assert extract_entity_id(url) == "ChoIoJfg79jS47jAARoNL2cvMTFqN3Ixazh6MhAB"
+    assert extract_kg_id(url) == "/g/11j7r1k8z2"
