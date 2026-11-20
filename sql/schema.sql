@@ -215,3 +215,4 @@ CREATE TABLE IF NOT EXISTS pilot_sample (
   stratum text,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE UNIQUE INDEX IF NOT EXISTS hotels_google_entity_uq ON hotels (google_entity_id) WHERE google_entity_id IS NOT NULL;
