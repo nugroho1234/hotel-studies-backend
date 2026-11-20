@@ -119,7 +119,10 @@ ALTER TABLE scrape_runs ADD CONSTRAINT scrape_runs_pass_check
 ALTER TABLE scrape_runs ADD COLUMN IF NOT EXISTS status text;
 ALTER TABLE scrape_runs ADD COLUMN IF NOT EXISTS error text;
 
-CREATE OR REPLACE VIEW hotels_v AS
+-- the view expands h.* when created, so it is dropped and rebuilt to pick up new hotels columns
+ALTER TABLE hotels ADD COLUMN IF NOT EXISTS has_google_price boolean;  -- false = Google Hotels shows no price (hotel stays in Paper 1); NULL = not checked
+DROP VIEW IF EXISTS hotels_v;
+CREATE VIEW hotels_v AS
 SELECT h.*,
   h.star_class AS tripadvisor_class,
   h.google_star_rating AS google_class,

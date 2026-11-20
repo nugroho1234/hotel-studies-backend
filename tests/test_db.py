@@ -67,3 +67,18 @@ def test_in_paper1_sample_follows_is_selected_and_view_status():
         got = conn.execute("select review_id, in_paper1_sample from reviews where review_id in (999999999201, 999999999202) order by 1").fetchall()
         conn.rollback()
     assert got == [(999999999201, True), (999999999202, False)]
+
+
+def test_excluded_hotel_never_counts_as_eligible_in_cell_rows():
+    from hotel_study import reviews
+    cell = ("zz-test", 4)
+    with connect() as conn:
+        _apply_schema_in_txn(conn)
+        for i, (order, excl) in enumerate([(1, None), (2, "not_a_hotel")]):
+            hid = 999999999301 + i
+            upsert(conn, "hotels", [{"hotel_id": hid, "hotel_name": "T", "destination": cell[0], "star_class": 4, "final_star_rating": 4,
+                                     "review_url": f"https://example.invalid/-d{hid}-", "cell_order": order, "is_eligible": True,
+                                     "scrape_status": "complete", "exclusion_reason": excl}], "hotel_id")
+        rows = reviews._cell_rows(conn, cell)
+        conn.rollback()
+    assert [r[3] for r in rows] == [True, False]

@@ -247,7 +247,8 @@ def _spent(conn) -> float:
 
 def _cell_rows(conn, cell):
     """[(hotel_id, url, scrape_status, is_eligible, in_eligibility_test)] in cell_order."""
-    return conn.execute("SELECT hotel_id, review_url, scrape_status, is_eligible, in_eligibility_test FROM hotels "
+    # an excluded hotel (closed, not a hotel) never counts as eligible, so the next hotel in the cell order takes its place
+    return conn.execute("SELECT hotel_id, review_url, scrape_status, CASE WHEN exclusion_reason IS NOT NULL THEN false ELSE is_eligible END, in_eligibility_test FROM hotels "
                         "WHERE destination = %s AND final_star_rating = %s AND cell_order IS NOT NULL ORDER BY cell_order", cell).fetchall()
 
 
@@ -313,7 +314,7 @@ def scrape_pass2(client, conn, cfg: dict, limit: int | None = None, destination:
     if conn.execute("SELECT 1 FROM hotels h WHERE cell_order IS NOT NULL AND destination = ANY(%s) AND (scrape_status = 'not_scraped' OR "
                     "(scrape_status = 'needs_pass2' AND is_eligible IS NULL AND cell_order < coalesce((SELECT cell_order FROM ("
                     "SELECT cell_order, row_number() OVER (ORDER BY cell_order) rn FROM hotels h2 WHERE h2.destination = h.destination "
-                    "AND h2.final_star_rating = h.final_star_rating AND h2.is_eligible) t WHERE rn = %s), 1000000))) LIMIT 1",
+                    "AND h2.final_star_rating = h.final_star_rating AND h2.is_eligible AND h2.exclusion_reason IS NULL) t WHERE rn = %s), 1000000))) LIMIT 1",
                     (scope, cfg["ceiling"])).fetchone():
         raise RuntimeError("pass 2 refused: some cells in scope still have not_scraped or undecided hotels; finish scrape-reviews --pass 1 first")
     rows = conn.execute("SELECT hotel_id, destination, final_star_rating, review_url FROM hotels "
