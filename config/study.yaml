@@ -19,7 +19,7 @@ concurrency: 1
 target_raw_reviews_per_hotel: 600   # PRD: about 600 raw reviews per hotel; used only to suggest end_page
 rate_min_pages: 10   # only hotels with at least this many pages enter the reviews-per-page estimate
 end_page: 41          # owner decision 2026-11-20: suggested by report --eligibility-test (about 600 raw reviews per hotel at 14.9 per page)
-max_spend_usd: 90   # owner raised from 85 on 2026-11-20 (Bali run)
+max_spend_usd: 95   # owner raised 85 -> 90 -> 95 on 2026-11-20 (pass 2)
 delete_remote_datasets: true
 pilot_size: 100
 pilot_min_id: 20
