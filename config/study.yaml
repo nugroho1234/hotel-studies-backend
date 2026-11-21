@@ -43,3 +43,11 @@ subrating_labels:   # ratingLabel text per subrating column (locale en and id), 
   cleanliness: [Cleanliness, Kebersihan]
   service: [Service, Layanan]
   sleep_quality: [Sleep Quality, Kualitas Tidur]
+# Draft label-frequency pass (OSF: "solely to estimate how often each label occurs"; labels are discarded, never used to select reviews)
+draft_labels:
+  model: gpt-6-luna
+  n_reviews: 2000
+  codebook_path: output/codebook_v0.1.txt   # local only: the backend repo is public
+  price_per_mtok: {input: 0.1, output: 0.5}   # USD, owner-supplied 2026-11-21
+  max_spend_usd: 3
+  workers: 8

@@ -158,3 +158,11 @@ def report_cmd(eligibility_test: Annotated[bool, typer.Option("--eligibility-tes
     from hotel_study import report
 
     typer.echo((report.report_eligibility_test if eligibility_test else report.report_funnel)(limit, destination))
+
+
+@app.command("draft-labels")
+def draft_labels_cmd(limit: Limit = None) -> None:
+    """Draft LLM pass on a seeded random sample to ESTIMATE label frequencies (output/draft_*.csv; not for selection)."""
+    from hotel_study.draft_labels import draft_labels
+
+    typer.echo(draft_labels(limit))

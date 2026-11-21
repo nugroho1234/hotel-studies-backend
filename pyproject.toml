@@ -2,7 +2,7 @@
 name = "hotel-study"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["typer", "apify-client", "psycopg[binary]>=3", "pandas", "rapidfuzz", "pyyaml", "python-dotenv", "pytest"]
+dependencies = ["typer", "apify-client", "psycopg[binary]>=3", "pandas", "rapidfuzz", "pyyaml", "python-dotenv", "pytest", "openai"]
 
 [build-system]
 requires = ["setuptools"]
