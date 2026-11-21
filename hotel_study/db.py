@@ -5,6 +5,7 @@ from psycopg.types.json import Jsonb
 from hotel_study.config import ROOT, get_secret
 
 SCHEMA = ROOT / "sql" / "schema.sql"
+FRONTEND_SCHEMA = ROOT / "sql" / "frontend.sql"  # access layer for the web app; runs after the tables exist
 
 
 def connect() -> psycopg.Connection:
@@ -13,6 +14,7 @@ def connect() -> psycopg.Connection:
 
 def apply_schema(conn: psycopg.Connection) -> None:
     conn.execute(SCHEMA.read_text())
+    conn.execute(FRONTEND_SCHEMA.read_text())
     conn.commit()
 
 

@@ -200,3 +200,23 @@ def backup_study_data_cmd() -> None:
     from hotel_study.backup import backup_study_data
 
     typer.echo(backup_study_data())
+
+
+@app.command("set-profile")
+def set_profile_cmd(email: str, role: Annotated[str, typer.Option(help="lead | researcher | expert | coder")],
+                    name: Annotated[str, typer.Option(help="Display name (pseudonym)")]) -> None:
+    """Create or change the profile (role and display name) of an existing Supabase user, found by email."""
+    from hotel_study.db import connect
+
+    if role not in ("lead", "researcher", "expert", "coder"):
+        raise typer.BadParameter("role must be lead, researcher, expert or coder")
+    with connect() as conn:
+        row = conn.execute("SELECT id FROM auth.users WHERE lower(email) = lower(%s)", (email,)).fetchone()
+        if not row:
+            typer.echo("No such user in Supabase Auth.", err=True)
+            raise typer.Exit(1)
+        conn.execute("INSERT INTO profiles (user_id, role, display_name) VALUES (%s, %s, %s) "
+                     "ON CONFLICT (user_id) DO UPDATE SET role = EXCLUDED.role, display_name = EXCLUDED.display_name",
+                     (row[0], role, name))
+        conn.commit()
+    typer.echo(f"{name}: {role}")
