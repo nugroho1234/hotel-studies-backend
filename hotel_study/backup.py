@@ -26,7 +26,8 @@ def backup_study_data(out_dir: Path | None = None, conn=None) -> str:
     try:
         lines = []
         for name, q in TABLES.items():
-            if not conn.execute("SELECT to_regclass(%s)", (f"public.{name}",)).fetchone()[0]:
+            table = "reviews" if name == "review_roles" else name  # review_roles is a query over reviews
+            if not conn.execute("SELECT to_regclass(%s)", (f"public.{table}",)).fetchone()[0]:
                 lines.append(f"{name}: skipped (table does not exist yet)")
                 continue
             cur = conn.execute(q)
