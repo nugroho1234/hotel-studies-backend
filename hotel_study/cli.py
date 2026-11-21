@@ -192,3 +192,11 @@ def assign_supp_rel_cmd(force: Annotated[bool, typer.Option("--force", help="Red
     except RuntimeError as e:
         typer.echo(str(e), err=True)
         raise typer.Exit(1)
+
+
+@app.command("backup-study-data")
+def backup_study_data_cmd() -> None:
+    """Export coders' splits, submissions, agreed phrases, profiles (no emails) and sample roles to output/backup/study_<date>/."""
+    from hotel_study.backup import backup_study_data
+
+    typer.echo(backup_study_data())
