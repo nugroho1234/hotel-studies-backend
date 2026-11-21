@@ -134,6 +134,16 @@ BEGIN
     ORDER BY md5(r.review_id::text);
 END $$;
 
+-- Autosave: replace the signed-in coder's phrases of one review in one step (all or nothing). p_phrases = [{"start":0,"end":15}, ...].
+-- The row trigger still checks bounds, whitespace and overlap. Partial coverage is allowed here; finish_set demands full coverage.
+CREATE OR REPLACE FUNCTION save_splits(p_review bigint, p_phrases jsonb) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+BEGIN
+  IF NOT public.can_edit_split(p_review) THEN RAISE EXCEPTION 'this review cannot be edited'; END IF;
+  DELETE FROM public.human_splits WHERE review_id = p_review AND coder = auth.uid();
+  INSERT INTO public.human_splits (review_id, coder, start_offset, end_offset)
+    SELECT p_review, auth.uid(), (x->>'start')::integer, (x->>'end')::integer FROM jsonb_array_elements(p_phrases) x;
+END $$;
+
 -- Finish set: all reviews of the set must be fully covered; then they are locked.
 CREATE OR REPLACE FUNCTION finish_set(p_set text) RETURNS integer LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
 DECLARE n integer; bad integer;
@@ -204,9 +214,10 @@ DROP POLICY IF EXISTS agreed_lead_write ON agreed_phrases;
 CREATE POLICY agreed_lead_write ON agreed_phrases FOR ALL TO authenticated USING (public.app_role() = 'lead') WITH CHECK (public.app_role() = 'lead');
 
 -- ===== 7. Grants (everything else stays revoked) =====
+REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC, anon, authenticated;   -- functions created above default to PUBLIC execute
 GRANT SELECT ON profiles, set_access, split_submissions, agreed_phrases TO authenticated;
-GRANT SELECT, INSERT, UPDATE, DELETE ON human_splits TO authenticated;
+GRANT SELECT ON human_splits TO authenticated;   -- writes go through save_splits only
 GRANT INSERT, UPDATE, DELETE ON agreed_phrases TO authenticated;
-GRANT USAGE ON SEQUENCE human_splits_split_id_seq, agreed_phrases_phrase_id_seq TO authenticated;
-GRANT EXECUTE ON FUNCTION app_role(), can_edit_split(bigint), coder_queue(text), finish_set(text), set_set_open(text, boolean),
+GRANT USAGE ON SEQUENCE agreed_phrases_phrase_id_seq TO authenticated;
+GRANT EXECUTE ON FUNCTION app_role(), can_edit_split(bigint), coder_queue(text), save_splits(bigint, jsonb), finish_set(text), set_set_open(text, boolean),
                           unlock_set(uuid, text), review_meta() TO authenticated;
