@@ -47,6 +47,10 @@ $$ SELECT CASE WHEN p_training THEN 'training'
                WHEN p_gold IN ('dev_set','supp_rel_dev') THEN 'dev'
                WHEN p_gold IN ('test_set','supp_rel_test') THEN 'test' END $$;
 
+-- A closed round is an earlier development round: coders no longer see it, staff still do.
+ALTER TABLE reviews ADD COLUMN IF NOT EXISTS dev_round integer;
+ALTER TABLE reviews ADD COLUMN IF NOT EXISTS round_closed boolean NOT NULL DEFAULT false;
+
 -- ===== 4. Coders' splits (offsets: Unicode code points, half-open [start, end)) =====
 CREATE TABLE IF NOT EXISTS human_splits (
   split_id bigserial PRIMARY KEY,
@@ -86,7 +90,7 @@ CREATE OR REPLACE FUNCTION can_edit_split(p_review bigint) RETURNS boolean LANGU
 $$ SELECT public.app_role() = 'coder'
       AND NOT EXISTS (SELECT 1 FROM public.split_submissions s WHERE s.review_id = p_review AND s.coder = auth.uid())
       AND EXISTS (SELECT 1 FROM public.reviews r JOIN public.set_access a ON a.set_name = public.review_set(r.is_training, r.gold_set)
-                  WHERE r.review_id = p_review AND a.is_open) $$;
+                  WHERE r.review_id = p_review AND a.is_open AND NOT r.round_closed) $$;
 
 -- Row checks: inside the text, no leading/trailing whitespace, no overlap with the same coder's other phrases of the review.
 CREATE OR REPLACE FUNCTION human_splits_check() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
@@ -134,7 +138,7 @@ BEGIN
   RETURN QUERY
     SELECT r.review_id, r.language, r.text, (row_number() OVER (ORDER BY md5(r.review_id::text)))::integer,
            EXISTS (SELECT 1 FROM public.split_submissions s WHERE s.review_id = r.review_id AND s.coder = auth.uid())
-    FROM public.reviews r WHERE r.is_selected AND ((p_set = 'training' AND r.is_training) OR (p_set = 'dev' AND r.gold_set IN ('dev_set','supp_rel_dev'))
+    FROM public.reviews r WHERE r.is_selected AND ((p_set = 'training' AND r.is_training) OR (p_set = 'dev' AND r.gold_set IN ('dev_set','supp_rel_dev') AND NOT r.round_closed)
                                 OR (p_set = 'test' AND r.gold_set IN ('test_set','supp_rel_test')))
     ORDER BY md5(r.review_id::text);
 END $$;
@@ -156,12 +160,12 @@ BEGIN
   IF public.app_role() <> 'coder' THEN RAISE EXCEPTION 'coders only'; END IF;
   IF NOT EXISTS (SELECT 1 FROM public.set_access a WHERE a.set_name = p_set AND a.is_open) THEN RAISE EXCEPTION 'set % is not open', p_set; END IF;
   SELECT count(*) FILTER (WHERE NOT public.split_complete(r.review_id, auth.uid())), count(*) INTO bad, n
-  FROM public.reviews r WHERE r.is_selected AND ((p_set = 'training' AND r.is_training) OR (p_set = 'dev' AND r.gold_set IN ('dev_set','supp_rel_dev'))
+  FROM public.reviews r WHERE r.is_selected AND ((p_set = 'training' AND r.is_training) OR (p_set = 'dev' AND r.gold_set IN ('dev_set','supp_rel_dev') AND NOT r.round_closed)
                                 OR (p_set = 'test' AND r.gold_set IN ('test_set','supp_rel_test')))
     AND NOT EXISTS (SELECT 1 FROM public.split_submissions s WHERE s.review_id = r.review_id AND s.coder = auth.uid());
   IF bad > 0 THEN RAISE EXCEPTION '% review(s) are not fully split yet', bad; END IF;
   INSERT INTO public.split_submissions (review_id, coder)
-    SELECT r.review_id, auth.uid() FROM public.reviews r WHERE r.is_selected AND ((p_set = 'training' AND r.is_training) OR (p_set = 'dev' AND r.gold_set IN ('dev_set','supp_rel_dev'))
+    SELECT r.review_id, auth.uid() FROM public.reviews r WHERE r.is_selected AND ((p_set = 'training' AND r.is_training) OR (p_set = 'dev' AND r.gold_set IN ('dev_set','supp_rel_dev') AND NOT r.round_closed)
                                 OR (p_set = 'test' AND r.gold_set IN ('test_set','supp_rel_test')))
     ON CONFLICT DO NOTHING;
   RETURN n;
@@ -187,11 +191,11 @@ END $$;
 
 -- Lead/researcher: review text and set per review (no rating, hotel or title) for the stats and adjudication pages.
 DROP FUNCTION IF EXISTS review_meta();
-CREATE OR REPLACE FUNCTION review_meta() RETURNS TABLE (review_id bigint, lang text, set_name text, is_supp boolean, body text)
+CREATE OR REPLACE FUNCTION review_meta() RETURNS TABLE (review_id bigint, lang text, set_name text, is_supp boolean, body text, dev_round integer)
 LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = '' AS $$
 BEGIN
   IF public.app_role() NOT IN ('lead','researcher') THEN RAISE EXCEPTION 'staff only'; END IF;
-  RETURN QUERY SELECT r.review_id, r.language, public.review_set(r.is_training, r.gold_set), coalesce(r.gold_set IN ('supp_rel_dev','supp_rel_test'), false), r.text
+  RETURN QUERY SELECT r.review_id, r.language, public.review_set(r.is_training, r.gold_set), coalesce(r.gold_set IN ('supp_rel_dev','supp_rel_test'), false), r.text, r.dev_round
                FROM public.reviews r WHERE r.is_training OR r.gold_set IS NOT NULL;   -- no is_selected test: lets Postgres use the two partial indexes
 END $$;
 
@@ -346,7 +350,7 @@ END $$;
 CREATE OR REPLACE FUNCTION can_edit_label(p_phrase bigint) RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS
 $$ SELECT public.app_role() = 'coder'
      AND EXISTS (SELECT 1 FROM public.agreed_phrases a JOIN public.reviews r USING (review_id) JOIN public.label_access l
-                   ON l.set_name = CASE WHEN r.gold_set IN ('dev_set','supp_rel_dev') THEN 'dev' WHEN r.gold_set IN ('test_set','supp_rel_test') THEN 'test' END
+                   ON l.set_name = CASE WHEN r.gold_set IN ('dev_set','supp_rel_dev') AND NOT r.round_closed THEN 'dev' WHEN r.gold_set IN ('test_set','supp_rel_test') THEN 'test' END
                  WHERE a.phrase_id = p_phrase AND l.is_open
                    AND NOT EXISTS (SELECT 1 FROM public.label_submissions s WHERE s.review_id = a.review_id AND s.coder = auth.uid())) $$;
 
@@ -364,7 +368,7 @@ BEGIN
     FROM public.reviews r
     JOIN public.agreed_phrases a ON a.review_id = r.review_id
     LEFT JOIN public.human_labels h ON h.phrase_id = a.phrase_id AND h.coder = auth.uid()
-    WHERE ((p_set = 'dev' AND r.gold_set IN ('dev_set','supp_rel_dev')) OR (p_set = 'test' AND r.gold_set IN ('test_set','supp_rel_test')))
+    WHERE ((p_set = 'dev' AND r.gold_set IN ('dev_set','supp_rel_dev') AND NOT r.round_closed) OR (p_set = 'test' AND r.gold_set IN ('test_set','supp_rel_test')))
     ORDER BY md5(r.review_id::text), a.start_offset;
 END $$;
 
@@ -382,13 +386,13 @@ BEGIN
   IF public.app_role() <> 'coder' THEN RAISE EXCEPTION 'coders only'; END IF;
   IF NOT EXISTS (SELECT 1 FROM public.label_access l WHERE l.set_name = p_set AND l.is_open) THEN RAISE EXCEPTION 'labelling of set % is not open', p_set; END IF;
   SELECT count(*) INTO bad FROM public.reviews r JOIN public.agreed_phrases a USING (review_id)
-   WHERE ((p_set = 'dev' AND r.gold_set IN ('dev_set','supp_rel_dev')) OR (p_set = 'test' AND r.gold_set IN ('test_set','supp_rel_test')))
+   WHERE ((p_set = 'dev' AND r.gold_set IN ('dev_set','supp_rel_dev') AND NOT r.round_closed) OR (p_set = 'test' AND r.gold_set IN ('test_set','supp_rel_test')))
      AND NOT EXISTS (SELECT 1 FROM public.label_submissions s WHERE s.review_id = r.review_id AND s.coder = auth.uid())
      AND NOT EXISTS (SELECT 1 FROM public.human_labels h WHERE h.phrase_id = a.phrase_id AND h.coder = auth.uid());
   IF bad > 0 THEN RAISE EXCEPTION '% phrase(s) have no label yet', bad; END IF;
   INSERT INTO public.label_submissions (review_id, coder)
     SELECT DISTINCT r.review_id, auth.uid() FROM public.reviews r JOIN public.agreed_phrases a USING (review_id)
-     WHERE (p_set = 'dev' AND r.gold_set IN ('dev_set','supp_rel_dev')) OR (p_set = 'test' AND r.gold_set IN ('test_set','supp_rel_test'))
+     WHERE (p_set = 'dev' AND r.gold_set IN ('dev_set','supp_rel_dev') AND NOT r.round_closed) OR (p_set = 'test' AND r.gold_set IN ('test_set','supp_rel_test'))
     ON CONFLICT DO NOTHING;
   GET DIAGNOSTICS n = ROW_COUNT;
   RETURN n;
@@ -525,4 +529,125 @@ GRANT EXECUTE ON FUNCTION app_role(), can_edit_split(bigint), coder_queue(text),
                           can_edit_label(bigint), label_queue(text), save_label(bigint, text, text), finish_labels(text) TO authenticated;
 
 -- Refresh planner statistics: the sample columns were filled after the last automatic ANALYZE, and stale stats made the app queries scan the whole table.
+
+-- ===== 11. Development rounds and codebook versions =====
+-- Round 1 is the original draw. After a failed kappa and a newer codebook, the lead draws a fresh round: a reserve (never-used reviews,
+-- seed 42 + round) is made beforehand by `plan-dev-rounds`, and draw_dev_round() switches to it. Old rounds keep their data but close for coders.
+CREATE TABLE IF NOT EXISTS dev_rounds (
+  round integer PRIMARY KEY,
+  codebook_version text NOT NULL REFERENCES codebook_versions(version),
+  drawn_at timestamptz NOT NULL DEFAULT now(),
+  reason text NOT NULL,
+  drawn_by uuid
+);
+ALTER TABLE dev_rounds ENABLE ROW LEVEL SECURITY;
+INSERT INTO dev_rounds (round, codebook_version, reason) VALUES (1, '0.2', 'Original draw') ON CONFLICT DO NOTHING;
+UPDATE reviews SET dev_round = 1 WHERE gold_set IN ('dev_set','supp_rel_dev') AND dev_round IS NULL;
+
+CREATE TABLE IF NOT EXISTS dev_round_reserve (   -- no policy and no grant: only the Python backend and draw_dev_round() read it
+  round integer NOT NULL,
+  review_id bigint NOT NULL REFERENCES reviews(review_id),
+  role text NOT NULL CHECK (role IN ('dev_set','supp_rel_dev')),
+  PRIMARY KEY (round, review_id)
+);
+ALTER TABLE dev_round_reserve ENABLE ROW LEVEL SECURITY;
+
+-- Lead only: add a codebook version (markdown replaces the whole codebook page). The version label must be new.
+CREATE OR REPLACE FUNCTION upload_codebook(p_version text, p_body text, p_note text) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+BEGIN
+  IF public.app_role() <> 'lead' THEN RAISE EXCEPTION 'lead only'; END IF;
+  IF btrim(coalesce(p_version, '')) = '' OR btrim(coalesce(p_body, '')) = '' THEN RAISE EXCEPTION 'a version label and the codebook text are required'; END IF;
+  IF EXISTS (SELECT 1 FROM public.codebook_versions WHERE version = btrim(p_version)) THEN RAISE EXCEPTION 'version % already exists', btrim(p_version); END IF;
+  INSERT INTO public.codebook_versions (version, created_on, change_log, body, uploaded_by) VALUES (btrim(p_version), current_date, btrim(coalesce(p_note, '')), p_body, auth.uid());
+END $$;
+
+-- Everyone signed in reads the codebook (coders need it). body is NULL for versions that live only in the app bundle.
+CREATE OR REPLACE FUNCTION codebook_list() RETURNS TABLE (version text, created_at timestamptz, change_log text, body text)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS
+$$ SELECT c.version, c.created_at, c.change_log, c.body FROM public.codebook_versions c WHERE auth.uid() IS NOT NULL ORDER BY c.created_at DESC, c.version DESC $$;
+
+-- Lead and researchers: the rounds, plus what the lead needs to decide whether a fresh round can be drawn.
+CREATE OR REPLACE FUNCTION dev_round_status() RETURNS jsonb LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = '' AS $$
+DECLARE cur integer; cv text; rv text; res integer; fin integer; tot integer;
+BEGIN
+  IF public.app_role() NOT IN ('lead','researcher') THEN RAISE EXCEPTION 'staff only'; END IF;
+  SELECT max(round) INTO cur FROM public.dev_rounds;
+  SELECT codebook_version INTO rv FROM public.dev_rounds WHERE round = cur;
+  cv := public.current_codebook_version();
+  SELECT count(*) INTO res FROM public.dev_round_reserve WHERE round = cur + 1;
+  SELECT count(*) INTO tot FROM public.reviews x WHERE x.dev_round = cur AND x.gold_set IN ('dev_set','supp_rel_dev');
+  SELECT count(*) INTO fin FROM (
+    SELECT s.coder FROM public.label_submissions s JOIN public.reviews r USING (review_id)
+     WHERE r.dev_round = cur AND r.gold_set IN ('dev_set','supp_rel_dev') GROUP BY s.coder HAVING count(*) = tot) f;
+  RETURN jsonb_build_object('round', cur, 'roundVersion', rv, 'currentVersion', cv, 'newerCodebook', cv IS DISTINCT FROM rv, 'reserve', res, 'codersFinished', fin,
+    'rounds', (SELECT coalesce(jsonb_agg(jsonb_build_object('round', d.round, 'version', d.codebook_version, 'at', d.drawn_at, 'reason', d.reason) ORDER BY d.round), '[]') FROM public.dev_rounds d));
+END $$;
+
+-- Lead only: switch to the next fresh round. Needs a newer codebook version, two coders who finished labelling the current round, and the reserve.
+CREATE OR REPLACE FUNCTION draw_dev_round(p_reason text) RETURNS integer LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+DECLARE st jsonb; nxt integer;
+BEGIN
+  IF public.app_role() <> 'lead' THEN RAISE EXCEPTION 'lead only'; END IF;
+  IF btrim(coalesce(p_reason, '')) = '' THEN RAISE EXCEPTION 'a reason is required'; END IF;
+  st := public.dev_round_status();
+  IF NOT (st->>'newerCodebook')::boolean THEN RAISE EXCEPTION 'upload a newer codebook version first'; END IF;
+  IF (st->>'codersFinished')::integer < 2 THEN RAISE EXCEPTION 'two coders must finish labelling the current round first'; END IF;
+  nxt := (st->>'round')::integer + 1;
+  IF (st->>'reserve')::integer = 0 THEN RAISE EXCEPTION 'no reserve drawn for round %; run plan-dev-rounds', nxt; END IF;
+  IF EXISTS (SELECT 1 FROM public.dev_round_reserve q JOIN public.reviews r USING (review_id) WHERE q.round = nxt AND (r.is_training OR r.is_pilot OR r.gold_set IS NOT NULL))
+    THEN RAISE EXCEPTION 'a reserve review has been used elsewhere; redo plan-dev-rounds'; END IF;
+  UPDATE public.reviews SET round_closed = true WHERE gold_set IN ('dev_set','supp_rel_dev');
+  UPDATE public.reviews r SET gold_set = q.role, dev_round = nxt FROM public.dev_round_reserve q WHERE q.round = nxt AND q.review_id = r.review_id;
+  INSERT INTO public.dev_rounds (round, codebook_version, reason, drawn_by) VALUES (nxt, st->>'currentVersion', btrim(p_reason), auth.uid());
+  UPDATE public.set_access SET is_open = true, changed_at = now() WHERE set_name = 'dev';
+  UPDATE public.label_access SET is_open = false, changed_at = now() WHERE set_name = 'dev';
+  RETURN nxt;
+END $$;
+
+-- Re-confirmation (D4): gold labels decided under an earlier codebook version are confirmed or changed by the lead under the current version.
+CREATE TABLE IF NOT EXISTS gold_reconfirmations (
+  id bigserial PRIMARY KEY,
+  phrase_id bigint NOT NULL REFERENCES agreed_phrases(phrase_id) ON DELETE RESTRICT,
+  old_dimension text NOT NULL, old_sentiment text NOT NULL, old_version text,
+  new_dimension text NOT NULL, new_sentiment text NOT NULL, new_version text NOT NULL,
+  reason text NOT NULL,
+  decided_by uuid NOT NULL,
+  decided_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE gold_reconfirmations ENABLE ROW LEVEL SECURITY;
+
+CREATE OR REPLACE FUNCTION reconfirm_gold(p_phrase bigint, p_dimension text, p_sentiment text, p_reason text) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+DECLARE g public.gold_labels; cv text := public.current_codebook_version();
+BEGIN
+  IF public.app_role() <> 'lead' THEN RAISE EXCEPTION 'lead only'; END IF;
+  IF btrim(coalesce(p_reason, '')) = '' THEN RAISE EXCEPTION 'a reason is required'; END IF;
+  IF p_dimension NOT IN ('TAN','REL','RES','ASS','EMP','VAL','LOC','FNB','GEN','UNC','NON') OR p_sentiment NOT IN ('positive','negative','neutral') THEN RAISE EXCEPTION 'invalid label'; END IF;
+  SELECT * INTO g FROM public.gold_labels WHERE phrase_id = p_phrase;
+  IF NOT FOUND THEN RAISE EXCEPTION 'this phrase has no gold label yet'; END IF;
+  INSERT INTO public.gold_reconfirmations (phrase_id, old_dimension, old_sentiment, old_version, new_dimension, new_sentiment, new_version, reason, decided_by)
+    VALUES (p_phrase, g.dimension, g.sentiment, g.codebook_version, p_dimension, p_sentiment, cv, btrim(p_reason), auth.uid());
+  UPDATE public.gold_labels SET dimension = p_dimension, sentiment = p_sentiment, codebook_version = cv, decided_by = auth.uid(), decided_at = now() WHERE phrase_id = p_phrase;
+END $$;
+
+-- Keep every outdated gold label as it is, under the current version (one reason for all).
+CREATE OR REPLACE FUNCTION reconfirm_all_gold(p_reason text) RETURNS integer LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+DECLARE n integer; cv text := public.current_codebook_version();
+BEGIN
+  IF public.app_role() <> 'lead' THEN RAISE EXCEPTION 'lead only'; END IF;
+  IF btrim(coalesce(p_reason, '')) = '' THEN RAISE EXCEPTION 'a reason is required'; END IF;
+  INSERT INTO public.gold_reconfirmations (phrase_id, old_dimension, old_sentiment, old_version, new_dimension, new_sentiment, new_version, reason, decided_by)
+    SELECT phrase_id, dimension, sentiment, codebook_version, dimension, sentiment, cv, btrim(p_reason), auth.uid() FROM public.gold_labels WHERE codebook_version IS DISTINCT FROM cv;
+  GET DIAGNOSTICS n = ROW_COUNT;
+  UPDATE public.gold_labels SET codebook_version = cv, decided_by = auth.uid(), decided_at = now() WHERE codebook_version IS DISTINCT FROM cv;
+  RETURN n;
+END $$;
+
+DROP POLICY IF EXISTS gold_reconfirmations_select ON gold_reconfirmations;
+CREATE POLICY gold_reconfirmations_select ON gold_reconfirmations FOR SELECT TO authenticated USING (public.app_role() = 'lead');
+DROP POLICY IF EXISTS dev_rounds_select ON dev_rounds;
+CREATE POLICY dev_rounds_select ON dev_rounds FOR SELECT TO authenticated USING (public.app_role() IN ('lead','researcher'));
+REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC, anon;
+GRANT SELECT ON gold_reconfirmations, dev_rounds TO authenticated;
+GRANT EXECUTE ON FUNCTION upload_codebook(text,text,text), codebook_list(), dev_round_status(), draw_dev_round(text),
+  reconfirm_gold(bigint,text,text,text), reconfirm_all_gold(text) TO authenticated;
 ANALYZE reviews;

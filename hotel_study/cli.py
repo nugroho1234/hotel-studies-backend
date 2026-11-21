@@ -220,3 +220,12 @@ def set_profile_cmd(email: str, role: Annotated[str, typer.Option(help="lead | r
                      (row[0], role, name))
         conn.commit()
     typer.echo(f"{name}: {role}")
+
+
+@app.command("plan-dev-rounds")
+def plan_dev_rounds_cmd(rounds: Annotated[int, typer.Option(help="How many fresh rounds to prepare")] = 1,
+                        force: Annotated[bool, typer.Option("--force", help="Redraw reserves not yet used")] = False) -> None:
+    """Pre-draw the reserve of never-used reviews for the next fresh dev round(s) (70 + 25 supplement, seed 42 + round)."""
+    from hotel_study.dev_rounds import plan_rounds
+
+    typer.echo(plan_rounds(rounds, force))
