@@ -166,3 +166,16 @@ def draft_labels_cmd(limit: Limit = None) -> None:
     from hotel_study.draft_labels import draft_labels
 
     typer.echo(draft_labels(limit))
+
+
+@app.command("assign-sample-roles")
+def assign_sample_roles_cmd(force: Annotated[bool, typer.Option("--force", help="Redraw even if roles exist")] = False,
+                            dry_run: Annotated[bool, typer.Option("--dry-run", help="Draw and print, write nothing")] = False) -> None:
+    """Assign training (30) and gold (200 = 70 dev_set + 130 test_set) roles to selected non-pilot reviews, seed 42."""
+    from hotel_study.sample_roles import assign_sample_roles
+
+    try:
+        typer.echo(assign_sample_roles(force, dry_run))
+    except RuntimeError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(1)

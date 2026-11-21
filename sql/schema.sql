@@ -216,3 +216,12 @@ CREATE TABLE IF NOT EXISTS pilot_sample (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX IF NOT EXISTS hotels_google_entity_uq ON hotels (google_entity_id) WHERE google_entity_id IS NOT NULL;
+
+-- Sample roles for Paper 1 (pilot is is_pilot above): training, and gold standard split into dev_set/test_set.
+ALTER TABLE reviews ADD COLUMN IF NOT EXISTS is_training boolean NOT NULL DEFAULT false;
+ALTER TABLE reviews ADD COLUMN IF NOT EXISTS gold_set text;
+ALTER TABLE reviews DROP CONSTRAINT IF EXISTS reviews_gold_set_chk;
+ALTER TABLE reviews ADD CONSTRAINT reviews_gold_set_chk CHECK (gold_set IN ('dev_set','test_set'));
+ALTER TABLE reviews DROP CONSTRAINT IF EXISTS reviews_role_excl_chk;
+ALTER TABLE reviews ADD CONSTRAINT reviews_role_excl_chk CHECK (
+  NOT (is_pilot AND is_training) AND (gold_set IS NULL OR NOT (is_pilot OR is_training)));

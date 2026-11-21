@@ -51,3 +51,4 @@ draft_labels:
   price_per_mtok: {input: 0.1, output: 0.5}   # USD, owner-supplied 2026-11-21
   max_spend_usd: 3
   workers: 8
+sample_roles: {training_size: 30, gold_size: 200, dev_size: 70, rating_bands: {low: [1, 2], mid: [3, 3], high: [4, 5]}}
