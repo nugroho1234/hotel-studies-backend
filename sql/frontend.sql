@@ -186,13 +186,22 @@ BEGIN
 END $$;
 
 -- Lead/researcher: review text and set per review (no rating, hotel or title) for the stats and adjudication pages.
-CREATE OR REPLACE FUNCTION review_meta() RETURNS TABLE (review_id bigint, lang text, set_name text, body text)
+DROP FUNCTION IF EXISTS review_meta();
+CREATE OR REPLACE FUNCTION review_meta() RETURNS TABLE (review_id bigint, lang text, set_name text, is_supp boolean, body text)
 LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = '' AS $$
 BEGIN
   IF public.app_role() NOT IN ('lead','researcher') THEN RAISE EXCEPTION 'staff only'; END IF;
-  RETURN QUERY SELECT r.review_id, r.language, public.review_set(r.is_training, r.gold_set), r.text
+  RETURN QUERY SELECT r.review_id, r.language, public.review_set(r.is_training, r.gold_set), coalesce(r.gold_set IN ('supp_rel_dev','supp_rel_test'), false), r.text
                FROM public.reviews r WHERE r.is_training OR r.gold_set IS NOT NULL;   -- no is_selected test: lets Postgres use the two partial indexes
 END $$;
+
+-- ===== 7b. Codebook versions: every adjudication records the version it was decided under =====
+ALTER TABLE codebook_versions ADD COLUMN IF NOT EXISTS body text;
+ALTER TABLE codebook_versions ADD COLUMN IF NOT EXISTS uploaded_by uuid;
+ALTER TABLE codebook_versions ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();
+INSERT INTO codebook_versions (version, created_on, change_log) VALUES ('0.2', current_date, 'Draft with the splitting rules, as shown in the app. Decisions so far are logged under this version.') ON CONFLICT DO NOTHING;
+CREATE OR REPLACE FUNCTION current_codebook_version() RETURNS text LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS
+$$ SELECT version FROM public.codebook_versions ORDER BY created_at DESC, version DESC LIMIT 1 $$;
 
 -- ===== 8. Adjudication of splits (lead). Result: agreed_phrases + an immutable log (OSF: both versions, decision, reason) =====
 CREATE TABLE IF NOT EXISTS adjudication_log (
@@ -207,14 +216,17 @@ CREATE TABLE IF NOT EXISTS adjudication_log (
   decided_by uuid NOT NULL REFERENCES profiles(user_id) ON DELETE RESTRICT,
   decided_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE adjudication_log ADD COLUMN IF NOT EXISTS codebook_gap boolean NOT NULL DEFAULT false;   -- the codebook did not settle this case
+ALTER TABLE adjudication_log ADD COLUMN IF NOT EXISTS codebook_version text;
 CREATE INDEX IF NOT EXISTS adjudication_log_review_idx ON adjudication_log (review_id);
 ALTER TABLE adjudication_log ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS adjudication_log_select ON adjudication_log;
-CREATE POLICY adjudication_log_select ON adjudication_log FOR SELECT TO authenticated USING (public.app_role() IN ('lead','researcher'));
+CREATE POLICY adjudication_log_select ON adjudication_log FOR SELECT TO authenticated USING (public.app_role() = 'lead');   -- adjudication is the lead's
 
 -- Save the agreed split of one review. Both coders must have finished it. The two original splits are copied from human_splits
 -- here (not taken from the browser), so the log cannot be edited from the page. Re-deciding a review adds a new log row.
-CREATE OR REPLACE FUNCTION save_adjudication(p_review bigint, p_coder_a uuid, p_coder_b uuid, p_final jsonb, p_reason text)
+DROP FUNCTION IF EXISTS save_adjudication(bigint, uuid, uuid, jsonb, text);
+CREATE OR REPLACE FUNCTION save_adjudication(p_review bigint, p_coder_a uuid, p_coder_b uuid, p_final jsonb, p_reason text, p_gap boolean DEFAULT false)
 RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
 DECLARE t text; prev integer := 0; n integer := 0; r record; sa jsonb; sb jsonb;
 BEGIN
@@ -241,8 +253,8 @@ BEGIN
     FROM public.human_splits h WHERE h.review_id = p_review AND h.coder = p_coder_a;
   SELECT coalesce(jsonb_agg(jsonb_build_object('start', h.start_offset, 'end', h.end_offset) ORDER BY h.start_offset), '[]') INTO sb
     FROM public.human_splits h WHERE h.review_id = p_review AND h.coder = p_coder_b;
-  INSERT INTO public.adjudication_log (review_id, coder_a, coder_b, split_a, split_b, final_split, reason, decided_by)
-    VALUES (p_review, p_coder_a, p_coder_b, sa, sb, p_final, btrim(p_reason), auth.uid());
+  INSERT INTO public.adjudication_log (review_id, coder_a, coder_b, split_a, split_b, final_split, reason, decided_by, codebook_gap, codebook_version)
+    VALUES (p_review, p_coder_a, p_coder_b, sa, sb, p_final, btrim(p_reason), auth.uid(), p_gap, public.current_codebook_version());
   DELETE FROM public.agreed_phrases WHERE review_id = p_review;
   INSERT INTO public.agreed_phrases (review_id, start_offset, end_offset, phrase_text)
     SELECT p_review, q.s, q.e, substr(t, q.s + 1, q.e - q.s)
@@ -382,6 +394,83 @@ BEGIN
   RETURN n;
 END $$;
 
+-- ===== 10. Gold labels: labels both coders agree on, or the lead decides (with a reason and, if needed, a codebook-gap flag) =====
+CREATE TABLE IF NOT EXISTS gold_labels (
+  phrase_id bigint PRIMARY KEY REFERENCES agreed_phrases(phrase_id) ON DELETE RESTRICT,
+  dimension text NOT NULL CHECK (dimension IN ('TAN','REL','RES','ASS','EMP','VAL','LOC','FNB','GEN','UNC','NON')),
+  sentiment text NOT NULL CHECK (sentiment IN ('positive','negative','neutral')),
+  by_coders boolean NOT NULL,        -- true: both coders chose the same, no discussion
+  codebook_version text,
+  decided_by uuid REFERENCES profiles(user_id) ON DELETE RESTRICT,
+  decided_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE gold_labels ENABLE ROW LEVEL SECURITY;
+
+CREATE TABLE IF NOT EXISTS label_adjudication_log (
+  log_id bigserial PRIMARY KEY,
+  phrase_id bigint NOT NULL REFERENCES agreed_phrases(phrase_id) ON DELETE RESTRICT,
+  coder_a uuid NOT NULL REFERENCES profiles(user_id) ON DELETE RESTRICT,
+  coder_b uuid NOT NULL REFERENCES profiles(user_id) ON DELETE RESTRICT,
+  label_a jsonb NOT NULL,            -- {"dimension":"TAN","sentiment":"positive"} copied from human_labels
+  label_b jsonb NOT NULL,
+  final_label jsonb NOT NULL,
+  reason text NOT NULL CHECK (btrim(reason) <> ''),
+  codebook_gap boolean NOT NULL DEFAULT false,
+  codebook_version text,
+  decided_by uuid NOT NULL REFERENCES profiles(user_id) ON DELETE RESTRICT,
+  decided_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS label_adjudication_log_phrase_idx ON label_adjudication_log (phrase_id);
+ALTER TABLE label_adjudication_log ENABLE ROW LEVEL SECURITY;
+
+CREATE OR REPLACE FUNCTION save_label_adjudication(p_phrase bigint, p_coder_a uuid, p_coder_b uuid, p_dimension text, p_sentiment text, p_reason text, p_gap boolean DEFAULT false)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+DECLARE la jsonb; lb jsonb; rid bigint;
+BEGIN
+  IF public.app_role() <> 'lead' THEN RAISE EXCEPTION 'lead only'; END IF;
+  IF p_coder_a = p_coder_b THEN RAISE EXCEPTION 'choose two different coders'; END IF;
+  IF coalesce(btrim(p_reason), '') = '' THEN RAISE EXCEPTION 'a reason is required'; END IF;
+  SELECT a.review_id INTO rid FROM public.agreed_phrases a WHERE a.phrase_id = p_phrase;
+  IF rid IS NULL THEN RAISE EXCEPTION 'unknown phrase'; END IF;
+  IF (SELECT count(*) FROM public.label_submissions s WHERE s.review_id = rid AND s.coder IN (p_coder_a, p_coder_b)) <> 2 THEN
+    RAISE EXCEPTION 'both coders must have finished labelling this review';
+  END IF;
+  SELECT jsonb_build_object('dimension', h.dimension, 'sentiment', h.sentiment) INTO la FROM public.human_labels h WHERE h.phrase_id = p_phrase AND h.coder = p_coder_a;
+  SELECT jsonb_build_object('dimension', h.dimension, 'sentiment', h.sentiment) INTO lb FROM public.human_labels h WHERE h.phrase_id = p_phrase AND h.coder = p_coder_b;
+  IF la IS NULL OR lb IS NULL THEN RAISE EXCEPTION 'both coders must have labelled this phrase'; END IF;
+  INSERT INTO public.gold_labels (phrase_id, dimension, sentiment, by_coders, codebook_version, decided_by)
+    VALUES (p_phrase, p_dimension, p_sentiment, false, public.current_codebook_version(), auth.uid())
+    ON CONFLICT (phrase_id) DO UPDATE SET dimension = EXCLUDED.dimension, sentiment = EXCLUDED.sentiment, by_coders = false,
+      codebook_version = EXCLUDED.codebook_version, decided_by = EXCLUDED.decided_by, decided_at = now();
+  INSERT INTO public.label_adjudication_log (phrase_id, coder_a, coder_b, label_a, label_b, final_label, reason, codebook_gap, codebook_version, decided_by)
+    VALUES (p_phrase, p_coder_a, p_coder_b, la, lb, jsonb_build_object('dimension', p_dimension, 'sentiment', p_sentiment), btrim(p_reason), p_gap,
+            public.current_codebook_version(), auth.uid());
+END $$;
+
+-- Phrases where both coders chose the same dimension and sentiment need no discussion.
+CREATE OR REPLACE FUNCTION accept_identical_labels(p_set text, p_coder_a uuid, p_coder_b uuid) RETURNS integer
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+DECLARE n integer;
+BEGIN
+  IF public.app_role() <> 'lead' THEN RAISE EXCEPTION 'lead only'; END IF;
+  IF p_coder_a = p_coder_b THEN RAISE EXCEPTION 'choose two different coders'; END IF;
+  IF p_set NOT IN ('dev', 'test') THEN RAISE EXCEPTION 'only the development and test sets are adjudicated'; END IF;
+  WITH ins AS (
+    INSERT INTO public.gold_labels (phrase_id, dimension, sentiment, by_coders, codebook_version, decided_by)
+    SELECT a.phrase_id, ha.dimension, ha.sentiment, true, public.current_codebook_version(), auth.uid()
+    FROM public.agreed_phrases a
+    JOIN public.reviews r ON r.review_id = a.review_id
+    JOIN public.human_labels ha ON ha.phrase_id = a.phrase_id AND ha.coder = p_coder_a
+    JOIN public.human_labels hb ON hb.phrase_id = a.phrase_id AND hb.coder = p_coder_b
+    WHERE ((p_set = 'dev' AND r.gold_set IN ('dev_set','supp_rel_dev')) OR (p_set = 'test' AND r.gold_set IN ('test_set','supp_rel_test')))
+      AND ha.dimension = hb.dimension AND ha.sentiment = hb.sentiment
+      AND NOT EXISTS (SELECT 1 FROM public.gold_labels g WHERE g.phrase_id = a.phrase_id)
+      AND (SELECT count(*) FROM public.label_submissions s WHERE s.review_id = a.review_id AND s.coder IN (p_coder_a, p_coder_b)) = 2
+    RETURNING 1)
+  SELECT count(*) INTO n FROM ins;
+  RETURN n;
+END $$;
+
 -- ===== 6. Policies =====
 DROP POLICY IF EXISTS profiles_self ON profiles;
 CREATE POLICY profiles_self ON profiles FOR SELECT TO authenticated USING (user_id = auth.uid() OR public.app_role() IN ('lead','researcher'));
@@ -418,12 +507,21 @@ CREATE POLICY labels_staff_select ON human_labels FOR SELECT TO authenticated US
 DROP POLICY IF EXISTS label_subs_select ON label_submissions;
 CREATE POLICY label_subs_select ON label_submissions FOR SELECT TO authenticated USING (coder = auth.uid() OR public.app_role() IN ('lead','researcher'));
 
+DROP POLICY IF EXISTS gold_labels_select ON gold_labels;
+CREATE POLICY gold_labels_select ON gold_labels FOR SELECT TO authenticated USING (public.app_role() IN ('lead','researcher'));
+DROP POLICY IF EXISTS label_adj_log_select ON label_adjudication_log;
+CREATE POLICY label_adj_log_select ON label_adjudication_log FOR SELECT TO authenticated USING (public.app_role() = 'lead');
+ALTER TABLE codebook_versions ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS codebook_versions_select ON codebook_versions;
+CREATE POLICY codebook_versions_select ON codebook_versions FOR SELECT TO authenticated USING (public.app_role() IN ('lead','researcher'));
+
 -- ===== 7. Grants (everything else stays revoked) =====
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC, anon, authenticated;   -- functions created above default to PUBLIC execute
 GRANT SELECT ON profiles, set_access, split_submissions, agreed_phrases, adjudication_log TO authenticated;   -- agreed_phrases and the log are written only by the functions below
-GRANT SELECT ON human_splits, label_access, human_labels, label_submissions TO authenticated;   -- writes go through save_splits only
+GRANT SELECT ON human_splits, label_access, human_labels, label_submissions, gold_labels, label_adjudication_log, codebook_versions TO authenticated;   -- writes go through save_splits only
 GRANT EXECUTE ON FUNCTION app_role(), can_edit_split(bigint), coder_queue(text), save_splits(bigint, jsonb), finish_set(text), set_set_open(text, boolean),
-                          unlock_set(uuid, text), review_meta(), save_adjudication(bigint, uuid, uuid, jsonb, text), accept_identical(text, uuid, uuid), set_label_open(text, boolean), unlock_labels(uuid, text),
+                          unlock_set(uuid, text), review_meta(), save_adjudication(bigint, uuid, uuid, jsonb, text, boolean), accept_identical(text, uuid, uuid), set_label_open(text, boolean), unlock_labels(uuid, text),
+                          save_label_adjudication(bigint, uuid, uuid, text, text, text, boolean), accept_identical_labels(text, uuid, uuid),
                           can_edit_label(bigint), label_queue(text), save_label(bigint, text, text), finish_labels(text) TO authenticated;
 
 -- Refresh planner statistics: the sample columns were filled after the last automatic ANALYZE, and stale stats made the app queries scan the whole table.
