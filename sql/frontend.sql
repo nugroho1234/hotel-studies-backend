@@ -191,7 +191,7 @@ LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = '' AS $$
 BEGIN
   IF public.app_role() NOT IN ('lead','researcher') THEN RAISE EXCEPTION 'staff only'; END IF;
   RETURN QUERY SELECT r.review_id, r.language, public.review_set(r.is_training, r.gold_set), r.text
-               FROM public.reviews r WHERE r.is_selected AND public.review_set(r.is_training, r.gold_set) IS NOT NULL;
+               FROM public.reviews r WHERE r.is_training OR r.gold_set IS NOT NULL;   -- no is_selected test: lets Postgres use the two partial indexes
 END $$;
 
 -- ===== 6. Policies =====
@@ -229,3 +229,6 @@ GRANT INSERT, UPDATE, DELETE ON agreed_phrases TO authenticated;
 GRANT USAGE ON SEQUENCE agreed_phrases_phrase_id_seq TO authenticated;
 GRANT EXECUTE ON FUNCTION app_role(), can_edit_split(bigint), coder_queue(text), save_splits(bigint, jsonb), finish_set(text), set_set_open(text, boolean),
                           unlock_set(uuid, text), review_meta() TO authenticated;
+
+-- Refresh planner statistics: the sample columns were filled after the last automatic ANALYZE, and stale stats made the app queries scan the whole table.
+ANALYZE reviews;
