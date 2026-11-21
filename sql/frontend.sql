@@ -224,6 +224,9 @@ BEGIN
   IF (SELECT count(*) FROM public.split_submissions s WHERE s.review_id = p_review AND s.coder IN (p_coder_a, p_coder_b)) <> 2 THEN
     RAISE EXCEPTION 'both coders must have finished this review';
   END IF;
+  IF EXISTS (SELECT 1 FROM public.human_labels l JOIN public.agreed_phrases a USING (phrase_id) WHERE a.review_id = p_review) THEN
+    RAISE EXCEPTION 'coders have already labelled this review, so its phrases cannot be changed';
+  END IF;
   SELECT x.text INTO t FROM public.reviews x WHERE x.review_id = p_review;
   IF t IS NULL THEN RAISE EXCEPTION 'unknown review'; END IF;
   FOR r IN SELECT q.s, q.e FROM (SELECT (x->>'start')::integer s, (x->>'end')::integer e FROM jsonb_array_elements(p_final) x) q ORDER BY q.s LOOP
@@ -272,6 +275,113 @@ BEGIN
   RETURN n;
 END $$;
 
+-- ===== 9. Stage 2: coders label the agreed phrases (dimension + sentiment). Same rules as splitting: own rows only, locked after finishing =====
+CREATE TABLE IF NOT EXISTS label_access (
+  set_name text PRIMARY KEY CHECK (set_name IN ('dev','test')),
+  is_open boolean NOT NULL DEFAULT false,
+  changed_at timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO label_access (set_name) VALUES ('dev'), ('test') ON CONFLICT DO NOTHING;
+ALTER TABLE label_access ENABLE ROW LEVEL SECURITY;
+
+-- One label (dimension) and one sentiment per phrase and coder. Dimensions: TAN tangibles, REL reliability, RES responsiveness,
+-- ASS assurance, EMP empathy, VAL value, LOC location, FNB food and beverage, GEN general service, UNC unclear, NON none.
+CREATE TABLE IF NOT EXISTS human_labels (
+  phrase_id bigint NOT NULL REFERENCES agreed_phrases(phrase_id) ON DELETE RESTRICT,
+  coder uuid NOT NULL REFERENCES profiles(user_id) ON DELETE RESTRICT,
+  dimension text NOT NULL CHECK (dimension IN ('TAN','REL','RES','ASS','EMP','VAL','LOC','FNB','GEN','UNC','NON')),
+  sentiment text NOT NULL CHECK (sentiment IN ('positive','negative','neutral')),
+  saved_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (phrase_id, coder)
+);
+ALTER TABLE human_labels ENABLE ROW LEVEL SECURITY;
+
+CREATE TABLE IF NOT EXISTS label_submissions (
+  review_id bigint NOT NULL REFERENCES reviews(review_id) ON DELETE RESTRICT,
+  coder uuid NOT NULL REFERENCES profiles(user_id) ON DELETE RESTRICT,
+  submitted_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (review_id, coder)
+);
+ALTER TABLE label_submissions ENABLE ROW LEVEL SECURITY;
+
+-- Lead only. Labelling of a set can open only when every review in it has agreed phrases (all splits adjudicated).
+CREATE OR REPLACE FUNCTION set_label_open(p_set text, p_open boolean) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+DECLARE missing integer;
+BEGIN
+  IF public.app_role() <> 'lead' THEN RAISE EXCEPTION 'lead only'; END IF;
+  IF p_set NOT IN ('dev', 'test') THEN RAISE EXCEPTION 'only the development and test sets are labelled'; END IF;
+  IF p_open THEN
+    SELECT count(*) INTO missing FROM public.reviews r
+     WHERE ((p_set = 'dev' AND r.gold_set IN ('dev_set','supp_rel_dev')) OR (p_set = 'test' AND r.gold_set IN ('test_set','supp_rel_test')))
+       AND NOT EXISTS (SELECT 1 FROM public.agreed_phrases a WHERE a.review_id = r.review_id);
+    IF missing > 0 THEN RAISE EXCEPTION '% review(s) have no agreed phrases yet; finish the split adjudication first', missing; END IF;
+  END IF;
+  UPDATE public.label_access SET is_open = p_open, changed_at = now() WHERE set_name = p_set;
+END $$;
+
+CREATE OR REPLACE FUNCTION unlock_labels(p_coder uuid, p_set text) RETURNS integer LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+DECLARE n integer;
+BEGIN
+  IF public.app_role() <> 'lead' THEN RAISE EXCEPTION 'lead only'; END IF;
+  DELETE FROM public.label_submissions s USING public.reviews r
+   WHERE s.review_id = r.review_id AND s.coder = p_coder
+     AND ((p_set = 'dev' AND r.gold_set IN ('dev_set','supp_rel_dev')) OR (p_set = 'test' AND r.gold_set IN ('test_set','supp_rel_test')));
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RETURN n;
+END $$;
+
+-- The signed-in coder may label this phrase: labelling of its set is open and the coder has not finished the review.
+CREATE OR REPLACE FUNCTION can_edit_label(p_phrase bigint) RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS
+$$ SELECT public.app_role() = 'coder'
+     AND EXISTS (SELECT 1 FROM public.agreed_phrases a JOIN public.reviews r USING (review_id) JOIN public.label_access l
+                   ON l.set_name = CASE WHEN r.gold_set IN ('dev_set','supp_rel_dev') THEN 'dev' WHEN r.gold_set IN ('test_set','supp_rel_test') THEN 'test' END
+                 WHERE a.phrase_id = p_phrase AND l.is_open
+                   AND NOT EXISTS (SELECT 1 FROM public.label_submissions s WHERE s.review_id = a.review_id AND s.coder = auth.uid())) $$;
+
+-- Coder queue for labelling: agreed phrases with the coder's own label. Review text only (no title, rating, hotel, other coder).
+CREATE OR REPLACE FUNCTION label_queue(p_set text)
+RETURNS TABLE (review_id bigint, lang text, body text, phrase_id bigint, start_offset integer, end_offset integer, phrase_text text,
+               dimension text, sentiment text, finished boolean)
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = '' AS $$
+BEGIN
+  IF public.app_role() <> 'coder' THEN RAISE EXCEPTION 'coders only'; END IF;
+  IF NOT EXISTS (SELECT 1 FROM public.label_access l WHERE l.set_name = p_set AND l.is_open) THEN RAISE EXCEPTION 'labelling of set % is not open', p_set; END IF;
+  RETURN QUERY
+    SELECT r.review_id, r.language, r.text, a.phrase_id, a.start_offset, a.end_offset, a.phrase_text, h.dimension, h.sentiment,
+           EXISTS (SELECT 1 FROM public.label_submissions s WHERE s.review_id = r.review_id AND s.coder = auth.uid())
+    FROM public.reviews r
+    JOIN public.agreed_phrases a ON a.review_id = r.review_id
+    LEFT JOIN public.human_labels h ON h.phrase_id = a.phrase_id AND h.coder = auth.uid()
+    WHERE ((p_set = 'dev' AND r.gold_set IN ('dev_set','supp_rel_dev')) OR (p_set = 'test' AND r.gold_set IN ('test_set','supp_rel_test')))
+    ORDER BY md5(r.review_id::text), a.start_offset;
+END $$;
+
+CREATE OR REPLACE FUNCTION save_label(p_phrase bigint, p_dimension text, p_sentiment text) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+BEGIN
+  IF NOT public.can_edit_label(p_phrase) THEN RAISE EXCEPTION 'this phrase cannot be labelled now'; END IF;
+  INSERT INTO public.human_labels (phrase_id, coder, dimension, sentiment) VALUES (p_phrase, auth.uid(), p_dimension, p_sentiment)
+    ON CONFLICT (phrase_id, coder) DO UPDATE SET dimension = EXCLUDED.dimension, sentiment = EXCLUDED.sentiment, saved_at = now();
+END $$;
+
+-- Finish labelling a set: every phrase of every review must have a label; then the reviews are locked for this coder.
+CREATE OR REPLACE FUNCTION finish_labels(p_set text) RETURNS integer LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+DECLARE n integer; bad integer;
+BEGIN
+  IF public.app_role() <> 'coder' THEN RAISE EXCEPTION 'coders only'; END IF;
+  IF NOT EXISTS (SELECT 1 FROM public.label_access l WHERE l.set_name = p_set AND l.is_open) THEN RAISE EXCEPTION 'labelling of set % is not open', p_set; END IF;
+  SELECT count(*) INTO bad FROM public.reviews r JOIN public.agreed_phrases a USING (review_id)
+   WHERE ((p_set = 'dev' AND r.gold_set IN ('dev_set','supp_rel_dev')) OR (p_set = 'test' AND r.gold_set IN ('test_set','supp_rel_test')))
+     AND NOT EXISTS (SELECT 1 FROM public.label_submissions s WHERE s.review_id = r.review_id AND s.coder = auth.uid())
+     AND NOT EXISTS (SELECT 1 FROM public.human_labels h WHERE h.phrase_id = a.phrase_id AND h.coder = auth.uid());
+  IF bad > 0 THEN RAISE EXCEPTION '% phrase(s) have no label yet', bad; END IF;
+  INSERT INTO public.label_submissions (review_id, coder)
+    SELECT DISTINCT r.review_id, auth.uid() FROM public.reviews r JOIN public.agreed_phrases a USING (review_id)
+     WHERE (p_set = 'dev' AND r.gold_set IN ('dev_set','supp_rel_dev')) OR (p_set = 'test' AND r.gold_set IN ('test_set','supp_rel_test'))
+    ON CONFLICT DO NOTHING;
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RETURN n;
+END $$;
+
 -- ===== 6. Policies =====
 DROP POLICY IF EXISTS profiles_self ON profiles;
 CREATE POLICY profiles_self ON profiles FOR SELECT TO authenticated USING (user_id = auth.uid() OR public.app_role() IN ('lead','researcher'));
@@ -299,12 +409,22 @@ CREATE POLICY agreed_select ON agreed_phrases FOR SELECT TO authenticated USING 
 DROP POLICY IF EXISTS agreed_lead_write ON agreed_phrases;
 CREATE POLICY agreed_lead_write ON agreed_phrases FOR ALL TO authenticated USING (public.app_role() = 'lead') WITH CHECK (public.app_role() = 'lead');
 
+DROP POLICY IF EXISTS label_access_read ON label_access;
+CREATE POLICY label_access_read ON label_access FOR SELECT TO authenticated USING (true);
+DROP POLICY IF EXISTS labels_coder_select ON human_labels;
+CREATE POLICY labels_coder_select ON human_labels FOR SELECT TO authenticated USING (coder = auth.uid());
+DROP POLICY IF EXISTS labels_staff_select ON human_labels;
+CREATE POLICY labels_staff_select ON human_labels FOR SELECT TO authenticated USING (public.app_role() IN ('lead','researcher'));
+DROP POLICY IF EXISTS label_subs_select ON label_submissions;
+CREATE POLICY label_subs_select ON label_submissions FOR SELECT TO authenticated USING (coder = auth.uid() OR public.app_role() IN ('lead','researcher'));
+
 -- ===== 7. Grants (everything else stays revoked) =====
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC, anon, authenticated;   -- functions created above default to PUBLIC execute
 GRANT SELECT ON profiles, set_access, split_submissions, agreed_phrases, adjudication_log TO authenticated;   -- agreed_phrases and the log are written only by the functions below
-GRANT SELECT ON human_splits TO authenticated;   -- writes go through save_splits only
+GRANT SELECT ON human_splits, label_access, human_labels, label_submissions TO authenticated;   -- writes go through save_splits only
 GRANT EXECUTE ON FUNCTION app_role(), can_edit_split(bigint), coder_queue(text), save_splits(bigint, jsonb), finish_set(text), set_set_open(text, boolean),
-                          unlock_set(uuid, text), review_meta(), save_adjudication(bigint, uuid, uuid, jsonb, text), accept_identical(text, uuid, uuid) TO authenticated;
+                          unlock_set(uuid, text), review_meta(), save_adjudication(bigint, uuid, uuid, jsonb, text), accept_identical(text, uuid, uuid), set_label_open(text, boolean), unlock_labels(uuid, text),
+                          can_edit_label(bigint), label_queue(text), save_label(bigint, text, text), finish_labels(text) TO authenticated;
 
 -- Refresh planner statistics: the sample columns were filled after the last automatic ANALYZE, and stale stats made the app queries scan the whole table.
 ANALYZE reviews;
