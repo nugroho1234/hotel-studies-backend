@@ -194,6 +194,84 @@ BEGIN
                FROM public.reviews r WHERE r.is_training OR r.gold_set IS NOT NULL;   -- no is_selected test: lets Postgres use the two partial indexes
 END $$;
 
+-- ===== 8. Adjudication of splits (lead). Result: agreed_phrases + an immutable log (OSF: both versions, decision, reason) =====
+CREATE TABLE IF NOT EXISTS adjudication_log (
+  log_id bigserial PRIMARY KEY,
+  review_id bigint NOT NULL REFERENCES reviews(review_id) ON DELETE RESTRICT,
+  coder_a uuid NOT NULL REFERENCES profiles(user_id) ON DELETE RESTRICT,
+  coder_b uuid NOT NULL REFERENCES profiles(user_id) ON DELETE RESTRICT,
+  split_a jsonb NOT NULL,     -- coder A's original phrases [{"start":0,"end":15},...] copied from human_splits
+  split_b jsonb NOT NULL,
+  final_split jsonb NOT NULL, -- the agreed phrases
+  reason text NOT NULL CHECK (btrim(reason) <> ''),
+  decided_by uuid NOT NULL REFERENCES profiles(user_id) ON DELETE RESTRICT,
+  decided_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS adjudication_log_review_idx ON adjudication_log (review_id);
+ALTER TABLE adjudication_log ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS adjudication_log_select ON adjudication_log;
+CREATE POLICY adjudication_log_select ON adjudication_log FOR SELECT TO authenticated USING (public.app_role() IN ('lead','researcher'));
+
+-- Save the agreed split of one review. Both coders must have finished it. The two original splits are copied from human_splits
+-- here (not taken from the browser), so the log cannot be edited from the page. Re-deciding a review adds a new log row.
+CREATE OR REPLACE FUNCTION save_adjudication(p_review bigint, p_coder_a uuid, p_coder_b uuid, p_final jsonb, p_reason text)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+DECLARE t text; prev integer := 0; n integer := 0; r record; sa jsonb; sb jsonb;
+BEGIN
+  IF public.app_role() <> 'lead' THEN RAISE EXCEPTION 'lead only'; END IF;
+  IF p_coder_a = p_coder_b THEN RAISE EXCEPTION 'choose two different coders'; END IF;
+  IF coalesce(btrim(p_reason), '') = '' THEN RAISE EXCEPTION 'a reason is required'; END IF;
+  IF (SELECT count(*) FROM public.split_submissions s WHERE s.review_id = p_review AND s.coder IN (p_coder_a, p_coder_b)) <> 2 THEN
+    RAISE EXCEPTION 'both coders must have finished this review';
+  END IF;
+  SELECT x.text INTO t FROM public.reviews x WHERE x.review_id = p_review;
+  IF t IS NULL THEN RAISE EXCEPTION 'unknown review'; END IF;
+  FOR r IN SELECT q.s, q.e FROM (SELECT (x->>'start')::integer s, (x->>'end')::integer e FROM jsonb_array_elements(p_final) x) q ORDER BY q.s LOOP
+    n := n + 1;
+    IF r.s < prev OR r.e <= r.s OR r.e > char_length(t) THEN RAISE EXCEPTION 'phrases must be in order, inside the review and not overlap'; END IF;
+    IF substr(t, r.s + 1, r.e - r.s) ~ '^\s|\s$' THEN RAISE EXCEPTION 'a phrase must not start or end with whitespace'; END IF;
+    IF substr(t, prev + 1, r.s - prev) ~ '\S' THEN RAISE EXCEPTION 'every word must be in a phrase'; END IF;
+    prev := r.e;
+  END LOOP;
+  IF n = 0 OR substr(t, prev + 1) ~ '\S' THEN RAISE EXCEPTION 'every word must be in a phrase'; END IF;
+  SELECT coalesce(jsonb_agg(jsonb_build_object('start', h.start_offset, 'end', h.end_offset) ORDER BY h.start_offset), '[]') INTO sa
+    FROM public.human_splits h WHERE h.review_id = p_review AND h.coder = p_coder_a;
+  SELECT coalesce(jsonb_agg(jsonb_build_object('start', h.start_offset, 'end', h.end_offset) ORDER BY h.start_offset), '[]') INTO sb
+    FROM public.human_splits h WHERE h.review_id = p_review AND h.coder = p_coder_b;
+  INSERT INTO public.adjudication_log (review_id, coder_a, coder_b, split_a, split_b, final_split, reason, decided_by)
+    VALUES (p_review, p_coder_a, p_coder_b, sa, sb, p_final, btrim(p_reason), auth.uid());
+  DELETE FROM public.agreed_phrases WHERE review_id = p_review;
+  INSERT INTO public.agreed_phrases (review_id, start_offset, end_offset, phrase_text)
+    SELECT p_review, q.s, q.e, substr(t, q.s + 1, q.e - q.s)
+    FROM (SELECT (x->>'start')::integer s, (x->>'end')::integer e FROM jsonb_array_elements(p_final) x) q ORDER BY q.s;
+END $$;
+
+-- Reviews of a set where both coders finished with exactly the same phrases need no discussion: copy them to agreed_phrases.
+CREATE OR REPLACE FUNCTION accept_identical(p_set text, p_coder_a uuid, p_coder_b uuid) RETURNS integer
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+DECLARE n integer;
+BEGIN
+  IF public.app_role() <> 'lead' THEN RAISE EXCEPTION 'lead only'; END IF;
+  IF p_coder_a = p_coder_b THEN RAISE EXCEPTION 'choose two different coders'; END IF;
+  IF p_set NOT IN ('dev', 'test') THEN RAISE EXCEPTION 'only the development and test sets are adjudicated'; END IF;
+  WITH same AS (
+    SELECT r.review_id, r.text FROM public.reviews r
+    WHERE ((p_set = 'dev' AND r.gold_set IN ('dev_set','supp_rel_dev')) OR (p_set = 'test' AND r.gold_set IN ('test_set','supp_rel_test')))
+      AND NOT EXISTS (SELECT 1 FROM public.agreed_phrases a WHERE a.review_id = r.review_id)
+      AND (SELECT count(*) FROM public.split_submissions s WHERE s.review_id = r.review_id AND s.coder IN (p_coder_a, p_coder_b)) = 2
+      AND NOT EXISTS (SELECT 1 FROM ((SELECT start_offset, end_offset FROM public.human_splits WHERE review_id = r.review_id AND coder = p_coder_a)
+                                     EXCEPT (SELECT start_offset, end_offset FROM public.human_splits WHERE review_id = r.review_id AND coder = p_coder_b)) d)
+      AND NOT EXISTS (SELECT 1 FROM ((SELECT start_offset, end_offset FROM public.human_splits WHERE review_id = r.review_id AND coder = p_coder_b)
+                                     EXCEPT (SELECT start_offset, end_offset FROM public.human_splits WHERE review_id = r.review_id AND coder = p_coder_a)) d)
+      AND EXISTS (SELECT 1 FROM public.human_splits WHERE review_id = r.review_id AND coder = p_coder_a)
+  ), ins AS (
+    INSERT INTO public.agreed_phrases (review_id, start_offset, end_offset, phrase_text)
+      SELECT h.review_id, h.start_offset, h.end_offset, substr(s.text, h.start_offset + 1, h.end_offset - h.start_offset)
+      FROM public.human_splits h JOIN same s USING (review_id) WHERE h.coder = p_coder_a RETURNING review_id)
+  SELECT count(DISTINCT review_id) INTO n FROM ins;
+  RETURN n;
+END $$;
+
 -- ===== 6. Policies =====
 DROP POLICY IF EXISTS profiles_self ON profiles;
 CREATE POLICY profiles_self ON profiles FOR SELECT TO authenticated USING (user_id = auth.uid() OR public.app_role() IN ('lead','researcher'));
@@ -223,12 +301,10 @@ CREATE POLICY agreed_lead_write ON agreed_phrases FOR ALL TO authenticated USING
 
 -- ===== 7. Grants (everything else stays revoked) =====
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC, anon, authenticated;   -- functions created above default to PUBLIC execute
-GRANT SELECT ON profiles, set_access, split_submissions, agreed_phrases TO authenticated;
+GRANT SELECT ON profiles, set_access, split_submissions, agreed_phrases, adjudication_log TO authenticated;   -- agreed_phrases and the log are written only by the functions below
 GRANT SELECT ON human_splits TO authenticated;   -- writes go through save_splits only
-GRANT INSERT, UPDATE, DELETE ON agreed_phrases TO authenticated;
-GRANT USAGE ON SEQUENCE agreed_phrases_phrase_id_seq TO authenticated;
 GRANT EXECUTE ON FUNCTION app_role(), can_edit_split(bigint), coder_queue(text), save_splits(bigint, jsonb), finish_set(text), set_set_open(text, boolean),
-                          unlock_set(uuid, text), review_meta() TO authenticated;
+                          unlock_set(uuid, text), review_meta(), save_adjudication(bigint, uuid, uuid, jsonb, text), accept_identical(text, uuid, uuid) TO authenticated;
 
 -- Refresh planner statistics: the sample columns were filled after the last automatic ANALYZE, and stale stats made the app queries scan the whole table.
 ANALYZE reviews;
