@@ -1,0 +1,17 @@
+# Reliability (H2) oversampling keywords, final list from the owner's reading of TripAdvisor reviews (2026-11-21).
+# `*` = any word ending (word start fixed); otherwise whole word or phrase. Case-insensitive. Matched on review text.
+en:
+  accuracy_advertised_promised: [as advertised, as described, as pictured, as pictures, as shown, like the photos, like the pictures, as promised, promised]
+  expectations_consistency: [up to expectation*, lived up to, come to expect, high standard*, consistent, consistency, reliable, everything was in order, throughout our visit]
+  room_readiness_requests: [ready before check-in, not ready, still not ready, request was fulfilled, as instructed]
+  regular_service: [cleaned daily, serviced regularly, offered daily, happened twice]
+  equipment: [working perfectly]
+  booking: [booking was, our booking, wrong booking, reservation, no record, overbook*, wrong room]
+  price_billing: [changed the price, different prices, revised the cost, refund*, charged, overcharg*, bill]
+  errors: [mistake*]
+id:
+  accuracy_advertised_ordered: [sesuai gambar, sesuai foto, sesuai pesanan, sesuai request, sesuai booking, sesuai ekspektasi, sesuai harapan, beda dengan foto, tidak sesuai, tdk sesuai, gak sesuai, ga sesuai, nggak sesuai]
+  promises_consistency: [dijanjikan, janji, konsisten]
+  room_readiness: [salah kamar, belum siap]
+  price_billing: [tagihan, ditagih, biaya tambahan]
+supplement: {size: 100, dev_size: 25}   # id and en halves; Indonesian capped by availability, English fills the rest

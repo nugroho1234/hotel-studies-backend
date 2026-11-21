@@ -179,3 +179,16 @@ def assign_sample_roles_cmd(force: Annotated[bool, typer.Option("--force", help=
     except RuntimeError as e:
         typer.echo(str(e), err=True)
         raise typer.Exit(1)
+
+
+@app.command("assign-supp-rel")
+def assign_supp_rel_cmd(force: Annotated[bool, typer.Option("--force", help="Redraw even if a supplement exists")] = False,
+                        dry_run: Annotated[bool, typer.Option("--dry-run", help="Draw and print, write nothing")] = False) -> None:
+    """Keyword oversample for reliability: 100 reviews (25 supp_rel_dev, 75 supp_rel_test) from config/rel_keywords.yaml."""
+    from hotel_study.supp_rel import assign_supp_rel
+
+    try:
+        typer.echo(assign_supp_rel(force, dry_run))
+    except RuntimeError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(1)

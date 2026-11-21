@@ -225,3 +225,7 @@ ALTER TABLE reviews ADD CONSTRAINT reviews_gold_set_chk CHECK (gold_set IN ('dev
 ALTER TABLE reviews DROP CONSTRAINT IF EXISTS reviews_role_excl_chk;
 ALTER TABLE reviews ADD CONSTRAINT reviews_role_excl_chk CHECK (
   NOT (is_pilot AND is_training) AND (gold_set IS NULL OR NOT (is_pilot OR is_training)));
+
+-- Reliability supplement (keyword-selected, added to the gold standard): extend the allowed gold_set values.
+ALTER TABLE reviews DROP CONSTRAINT IF EXISTS reviews_gold_set_chk;
+ALTER TABLE reviews ADD CONSTRAINT reviews_gold_set_chk CHECK (gold_set IN ('dev_set','test_set','supp_rel_dev','supp_rel_test'));
