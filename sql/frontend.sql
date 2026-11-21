@@ -120,6 +120,10 @@ BEGIN
   RETURN n > 0 AND substr(t, prev + 1) !~ '\S';
 END $$;
 
+-- Small partial indexes: the set predicates below must stay plain column tests so Postgres can use them (a function call per row timed out).
+CREATE INDEX IF NOT EXISTS reviews_training_idx ON reviews (review_id) WHERE is_training;
+CREATE INDEX IF NOT EXISTS reviews_gold_idx ON reviews (review_id) WHERE gold_set IS NOT NULL;
+
 -- ===== 5. Functions the web app calls =====
 -- Coder queue: review_id, language and text only (no title, rating, hotel). Same fixed order for every coder.
 CREATE OR REPLACE FUNCTION coder_queue(p_set text) RETURNS TABLE (review_id bigint, lang text, body text, pos integer, finished boolean)
@@ -130,7 +134,8 @@ BEGIN
   RETURN QUERY
     SELECT r.review_id, r.language, r.text, (row_number() OVER (ORDER BY md5(r.review_id::text)))::integer,
            EXISTS (SELECT 1 FROM public.split_submissions s WHERE s.review_id = r.review_id AND s.coder = auth.uid())
-    FROM public.reviews r WHERE r.is_selected AND public.review_set(r.is_training, r.gold_set) = p_set
+    FROM public.reviews r WHERE r.is_selected AND ((p_set = 'training' AND r.is_training) OR (p_set = 'dev' AND r.gold_set IN ('dev_set','supp_rel_dev'))
+                                OR (p_set = 'test' AND r.gold_set IN ('test_set','supp_rel_test')))
     ORDER BY md5(r.review_id::text);
 END $$;
 
@@ -151,11 +156,13 @@ BEGIN
   IF public.app_role() <> 'coder' THEN RAISE EXCEPTION 'coders only'; END IF;
   IF NOT EXISTS (SELECT 1 FROM public.set_access a WHERE a.set_name = p_set AND a.is_open) THEN RAISE EXCEPTION 'set % is not open', p_set; END IF;
   SELECT count(*) FILTER (WHERE NOT public.split_complete(r.review_id, auth.uid())), count(*) INTO bad, n
-  FROM public.reviews r WHERE r.is_selected AND public.review_set(r.is_training, r.gold_set) = p_set
+  FROM public.reviews r WHERE r.is_selected AND ((p_set = 'training' AND r.is_training) OR (p_set = 'dev' AND r.gold_set IN ('dev_set','supp_rel_dev'))
+                                OR (p_set = 'test' AND r.gold_set IN ('test_set','supp_rel_test')))
     AND NOT EXISTS (SELECT 1 FROM public.split_submissions s WHERE s.review_id = r.review_id AND s.coder = auth.uid());
   IF bad > 0 THEN RAISE EXCEPTION '% review(s) are not fully split yet', bad; END IF;
   INSERT INTO public.split_submissions (review_id, coder)
-    SELECT r.review_id, auth.uid() FROM public.reviews r WHERE r.is_selected AND public.review_set(r.is_training, r.gold_set) = p_set
+    SELECT r.review_id, auth.uid() FROM public.reviews r WHERE r.is_selected AND ((p_set = 'training' AND r.is_training) OR (p_set = 'dev' AND r.gold_set IN ('dev_set','supp_rel_dev'))
+                                OR (p_set = 'test' AND r.gold_set IN ('test_set','supp_rel_test')))
     ON CONFLICT DO NOTHING;
   RETURN n;
 END $$;
@@ -172,7 +179,8 @@ DECLARE n integer;
 BEGIN
   IF public.app_role() <> 'lead' THEN RAISE EXCEPTION 'lead only'; END IF;
   DELETE FROM public.split_submissions s USING public.reviews r
-   WHERE s.review_id = r.review_id AND s.coder = p_coder AND public.review_set(r.is_training, r.gold_set) = p_set;
+   WHERE s.review_id = r.review_id AND s.coder = p_coder AND ((p_set = 'training' AND r.is_training) OR (p_set = 'dev' AND r.gold_set IN ('dev_set','supp_rel_dev'))
+                                OR (p_set = 'test' AND r.gold_set IN ('test_set','supp_rel_test')));
   GET DIAGNOSTICS n = ROW_COUNT;
   RETURN n;
 END $$;
